@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ shop_name }} — Orders</title>
+<style>
+  body{ font-family: system-ui, sans-serif; background:#F7F4EC; margin:0; color:#20180F; }
+  header{ background:#1F4D36; color:#FFF8ED; padding:16px 24px; display:flex; justify-content:space-between; align-items:center; }
+  header h1{ font-size:18px; margin:0; }
+  header a{ color:#FFB13C; text-decoration:none; font-size:13px; }
+  .wrap{ padding:20px 24px; max-width:1000px; margin:0 auto; }
+  .stat{ background:white; border-radius:10px; padding:14px 18px; margin-bottom:18px; box-shadow:0 1px 4px rgba(0,0,0,0.08); display:inline-block; }
+  .stat b{ color:#FF6A3D; font-size:20px; }
+  table{ width:100%; border-collapse:collapse; background:white; border-radius:10px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); }
+  th, td{ text-align:left; padding:10px 12px; border-bottom:1px solid #eee; font-size:13px; vertical-align:top; }
+  th{ background:#FFF3E2; color:#1F4D36; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
+  .items{ font-size:12px; color:#555; }
+  .badge{ display:inline-block; padding:3px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+  .status-new{ background:#FFE3C2; color:#A85400; }
+  .status-confirmed{ background:#D6EAD8; color:#1F4D36; }
+  .status-out_for_delivery{ background:#D6E4F0; color:#1D4E8F; }
+  .status-delivered{ background:#DCF0DC; color:#1E6B1E; }
+  .status-cancelled{ background:#F0D6D6; color:#8F1D1D; }
+  select, button{ font-size:12px; padding:5px 8px; border-radius:6px; border:1px solid #ccc; }
+  button{ background:#FF6A3D; color:white; border:none; margin-left:6px; cursor:pointer; }
+  .pay{ font-size:11px; color:#666; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ shop_name }} — Orders</h1>
+  <a href="/logout">Log out</a>
+</header>
+<div class="wrap">
+  <div class="stat">Today's total: <b>₹{{ "%.0f"|format(today_total) }}</b></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th><th>Update</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for o in orders %}
+      <tr>
+        <td>{{ o.id }}<br><span class="pay">{{ o.created_at[:16].replace('T',' ') }}</span></td>
+        <td>{{ o.customers.wa_number if o.customers else '—' }}</td>
+        <td class="items">
+          {% for it in o.order_items %}
+            {{ it.product_name }} × {{ it.quantity }} {{ it.unit }}<br>
+          {% endfor %}
+        </td>
+        <td>₹{{ "%.0f"|format(o.total) }}</td>
+        <td class="pay">{{ o.payment_mode }} · {{ o.payment_status }}</td>
+        <td><span class="badge status-{{ o.status }}">{{ o.status.replace('_',' ') }}</span></td>
+        <td>
+          <form method="post" action="/orders/{{ o.id }}/status" style="display:flex;">
+            <select name="status">
+              <option value="new" {% if o.status=='new' %}selected{% endif %}>New</option>
+              <option value="confirmed" {% if o.status=='confirmed' %}selected{% endif %}>Confirmed</option>
+              <option value="out_for_delivery" {% if o.status=='out_for_delivery' %}selected{% endif %}>Out for delivery</option>
+              <option value="delivered" {% if o.status=='delivered' %}selected{% endif %}>Delivered</option>
+              <option value="cancelled" {% if o.status=='cancelled' %}selected{% endif %}>Cancelled</option>
+            </select>
+            <button type="submit">Save</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+</body>
+</html>
