@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ shop_name }} — New Phone Order</title>
+<style>
+  :root{ --green:#1F4D36; --orange:#FF6A3D; --cream:#FFF8ED; }
+  *{box-sizing:border-box;}
+  body{ font-family: system-ui, sans-serif; background:#F7F4EC; margin:0; }
+  header{ background:var(--green); color:var(--cream); padding:14px 16px; display:flex; justify-content:space-between; align-items:center; }
+  header h1{ font-size:16px; margin:0; }
+  header a{ color:var(--cream); text-decoration:none; font-size:13px; }
+  .wrap{ max-width:600px; margin:0 auto; padding:16px; }
+  .card{ background:white; border-radius:12px; padding:18px; box-shadow:0 1px 4px rgba(0,0,0,0.08); }
+  label{ display:block; font-size:12px; font-weight:700; color:var(--green); margin:14px 0 5px; text-transform:uppercase; letter-spacing:0.03em; }
+  input, select, textarea{ width:100%; padding:9px 10px; border-radius:8px; border:1px solid #ddd; font-size:14px; }
+  .item-row{ display:flex; gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid #f0f0f0; }
+  .item-row .name{ flex:1; font-size:13px; }
+  .item-row input{ width:80px; }
+  button.submit{ width:100%; margin-top:20px; background:var(--orange); color:white; border:none; padding:12px; border-radius:10px; font-weight:700; font-size:15px; cursor:pointer; }
+  .radio-group{ display:flex; gap:14px; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>New Phone Order</h1>
+  <a href="/orders">← Back to Orders</a>
+</header>
+<div class="wrap">
+  <form class="card" method="post" action="/orders/new">
+    <label>Customer WhatsApp number (required)</label>
+    <input type="text" name="wa_number" placeholder="e.g. 919876543210" required>
+
+    <label>Items — enter quantity for whatever they ordered</label>
+    {% for p in menu %}
+    <div class="item-row">
+      <span class="name">{{ p.name_en }}{% if p.name_hi %} ({{ p.name_hi }}){% endif %} — ₹{{ p.price }}/{{ p.unit }}</span>
+      <input type="number" step="0.1" min="0" name="qty_{{ p.id }}" placeholder="0">
+    </div>
+    {% endfor %}
+
+    <label>Fulfillment</label>
+    <div class="radio-group">
+      <label style="display:inline;text-transform:none;font-weight:400;"><input type="radio" name="fulfillment" value="delivery" checked style="width:auto;"> Delivery</label>
+      <label style="display:inline;text-transform:none;font-weight:400;"><input type="radio" name="fulfillment" value="pickup" style="width:auto;"> Pickup</label>
+    </div>
+
+    <label>Delivery address (if applicable)</label>
+    <input type="text" name="address" placeholder="Shop 4, Kandivali West...">
+
+    <label>Payment mode</label>
+    <select name="payment_mode">
+      <option value="cod">Cash / UPI on delivery</option>
+      <option value="upi">UPI (already paid)</option>
+    </select>
+
+    <label>Notes (optional)</label>
+    <textarea name="notes" rows="2" placeholder="e.g. no raw mango, call before delivering"></textarea>
+
+    <button class="submit" type="submit">Create Order & Notify Customer</button>
+  </form>
+</div>
+</body>
+</html>

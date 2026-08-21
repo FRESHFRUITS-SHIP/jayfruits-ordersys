@@ -2,23 +2,19 @@ import hashlib
 import hmac
 from fastapi import APIRouter, Request, Query, HTTPException, Response
 
-from app.config import META_VERIFY_TOKEN, META_APP_SECRET, SHOP_NAME, SHOP_WHATSAPP_DISPLAY_NUMBER
-from app.services.whatsapp import send_text, send_buttons
-from app.services.order_parser import parse_order
-from app.services.upi import build_upi_link
-from app.services.orders import (
-    get_available_menu,
-    get_or_create_customer,
-    match_products,
-    create_order,
-    set_order_payment_mode,
-    get_latest_open_order_for_customer,
+from app.config import (
+    META_VERIFY_TOKEN, META_APP_SECRET, SHOP_NAME,
+    SHOP_WHATSAPP_DISPLAY_NUMBER, PUBLIC_BASE_URL,
 )
+from app.services.whatsapp import send_text, send_buttons
+from app.services.order_parser import parse_message
+from app.services.upi import build_upi_link
+from app.services import orders as svc
 
 router = APIRouter()
 
 
-# ---------- webhook verification (Meta calls this once when you set up the webhook URL) ----------
+# ---------- webhook verification ----------
 @router.get("/webhook")
 async def verify_webhook(
     hub_mode: str = Query(..., alias="hub.mode"),
@@ -32,7 +28,7 @@ async def verify_webhook(
 
 def _verify_signature(body: bytes, signature_header: str | None) -> bool:
     if not META_APP_SECRET:
-        return True  # skip check if not configured (fine for local dev, NOT for production)
+        return True
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = hmac.new(META_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
@@ -53,51 +49,133 @@ async def receive_message(request: Request):
         change = entry["changes"][0]["value"]
         messages = change.get("messages")
         if not messages:
-            return {"status": "ignored"}  # delivery/read receipts etc.
+            return {"status": "ignored"}
 
         msg = messages[0]
         from_number = msg["from"]
 
         if msg["type"] == "text":
-            text = msg["text"]["body"]
-            await handle_text_message(from_number, text)
+            await handle_text_message(from_number, msg["text"]["body"])
         elif msg["type"] == "interactive":
-            button_id = msg["interactive"]["button_reply"]["id"]
-            await handle_button_reply(from_number, button_id)
+            reply = msg["interactive"].get("button_reply") or msg["interactive"].get("list_reply")
+            if reply:
+                await handle_button_reply(from_number, reply["id"])
+        elif msg["type"] in ("audio", "voice", "image", "video", "document"):
+            await send_text(
+                from_number,
+                "I can only read text messages right now — could you please type your order? 🙏\n"
+                "उदाहरण: '2kg mango, 1 dozen banana'",
+            )
         else:
             await send_text(from_number, "Please send your order as text, e.g. '2kg mango, 1 dozen banana'.")
 
     except (KeyError, IndexError):
-        pass  # malformed/unsupported payload shape — don't crash the webhook
+        pass
 
     return {"status": "ok"}
 
 
-# ---------- conversation logic ----------
+# ---------- helpers ----------
+def _t(lang: str, en: str, hi: str) -> str:
+    return hi if lang == "hi" else en
+
+
+async def _greeting_and_menu(to: str, lang: str) -> None:
+    menu = svc.get_available_menu()
+    if lang == "hi":
+        lines = [f"🍉 *{SHOP_NAME} में आपका स्वागत है!*\n"]
+        for p in menu:
+            hi_name = f" ({p['name_hi']})" if p.get("name_hi") else ""
+            lines.append(f"• {p['name_en']}{hi_name} — ₹{p['price']}/{p['unit']}")
+        lines.append("\nजो चाहिए वो लिखें, जैसे: '2kg mango, 1 dozen banana'")
+        lines.append(f"अपना मेन्यू व ऑर्डर हिस्ट्री यहाँ देखें: {PUBLIC_BASE_URL}/me/<link नीचे भेजा जाएगा>")
+    else:
+        lines = [f"🍉 *Welcome to {SHOP_NAME}!*\n"]
+        for p in menu:
+            hi_name = f" ({p['name_hi']})" if p.get("name_hi") else ""
+            lines.append(f"• {p['name_en']}{hi_name} — ₹{p['price']}/{p['unit']}")
+        lines.append("\nJust reply with what you'd like, e.g. '2kg mango, 1 dozen banana'.")
+    await send_text(to, "\n".join(lines))
+
+
+async def _send_menu_link(to: str, customer: dict) -> None:
+    link = f"{PUBLIC_BASE_URL}/me/{customer['page_token']}"
+    await send_text(to, f"🔗 Your menu & order history: {link}")
+
+
+# ---------- main conversation handler ----------
 async def handle_text_message(from_number: str, text: str) -> None:
-    customer = get_or_create_customer(from_number)
+    customer = svc.get_or_create_customer(from_number)
     stripped = text.strip().lower()
 
-    if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii"):
-        await send_menu(from_number)
+    if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
+        lang = customer.get("preferred_language") or "en"
+        await _greeting_and_menu(from_number, lang)
         return
 
-    menu = get_available_menu()
-    parsed = parse_order(text, menu)
+    menu = svc.get_available_menu()
+    parsed = parse_message(text, menu)
+    lang = parsed.get("language", "en")
 
-    if not parsed.get("is_order"):
-        note = parsed.get("customer_intent_note") or ""
-        reply = (
-            f"Namaste! Welcome to {SHOP_NAME}. 🍊🥭\n\n"
-            "Send your order like: '2kg mango, 1 dozen banana'\n"
-            "Or type 'menu' to see today's fruits & prices."
-        )
-        if note:
-            reply += f"\n\n(Note: {note})"
-        await send_text(from_number, reply)
+    # remember their language for future messages (menu, notifications, etc.)
+    if customer.get("preferred_language") != lang:
+        svc.set_customer_language(customer["id"], lang)
+        customer["preferred_language"] = lang
+
+    intent = parsed["intent"]
+
+    if intent == "greeting":
+        await _greeting_and_menu(from_number, lang)
         return
 
-    matched = match_products([i["product_name"] for i in parsed["items"]], menu)
+    if intent == "address":
+        await _handle_address(from_number, customer, parsed, lang)
+        return
+
+    if intent == "cancel_order":
+        await _handle_cancel(from_number, customer, lang)
+        return
+
+    if intent == "reorder":
+        await _handle_reorder(from_number, customer, lang)
+        return
+
+    if intent == "edit_order":
+        await _handle_edit(from_number, customer, parsed, lang)
+        return
+
+    if intent == "new_order":
+        await _handle_new_order(from_number, customer, parsed, text, lang)
+        return
+
+    # "other" — unclear message
+    note = parsed.get("note") or ""
+    reply = _t(
+        lang,
+        f"Not sure I understood that. Send your order like '2kg mango, 1 dozen banana', or type 'menu'.",
+        "समझ नहीं आया 🙏 ऑर्डर ऐसे भेजें: '2kg mango, 1 dozen banana', या 'menu' लिखें।",
+    )
+    if note:
+        reply += f"\n\n({note})"
+    await send_text(from_number, reply)
+
+
+# ---------- intent handlers ----------
+
+async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str, lang: str) -> None:
+    if not svc.is_within_business_hours():
+        settings = svc.get_shop_settings()
+        await send_text(to, _t(
+            lang,
+            f"We're currently closed. Our hours are {settings['business_hours_start']}:00–{settings['business_hours_end']}:00. "
+            "Send your order again once we're open and we'll get right on it! 🙏",
+            f"अभी दुकान बंद है। हमारा समय {settings['business_hours_start']}:00–{settings['business_hours_end']}:00 है। "
+            "कृपया दुकान खुलने पर दोबारा ऑर्डर भेजें 🙏",
+        ))
+        return
+
+    menu = svc.get_available_menu()
+    matched = svc.match_products([i["product_name"] for i in parsed["items"]], menu)
     items_for_order = []
     lines = []
     for item in parsed["items"]:
@@ -112,54 +190,202 @@ async def handle_text_message(from_number: str, text: str) -> None:
     unavailable = parsed.get("unavailable_items", [])
 
     if not items_for_order:
-        msg = "Sorry, I couldn't match any items on our menu. Type 'menu' to see what's available today."
-        await send_text(from_number, msg)
+        await send_text(to, _t(
+            lang,
+            "Sorry, I couldn't match any items on our menu. Type 'menu' to see what's available today.",
+            "माफ़ करें, कोई भी आइटम मेन्यू में नहीं मिला। आज का मेन्यू देखने के लिए 'menu' लिखें।",
+        ))
         return
 
-    order = create_order(customer["id"], items_for_order, raw_message=text)
+    total = sum(i["product"]["price"] * i["quantity"] for i in items_for_order)
+    settings = svc.get_shop_settings()
+    min_order = float(settings.get("minimum_order_value") or 0)
+    if min_order > 0 and total < min_order:
+        await send_text(to, _t(
+            lang,
+            f"Your order total is ₹{total:.0f}, but our minimum order is ₹{min_order:.0f}. "
+            "Please add a bit more to your order!",
+            f"आपका ऑर्डर ₹{total:.0f} का है, लेकिन न्यूनतम ऑर्डर ₹{min_order:.0f} है। "
+            "कृपया थोड़ा और जोड़ें।",
+        ))
+        return
+
+    address = customer.get("address") or ""
+    order = svc.create_order(
+        customer["id"], items_for_order, raw_message=raw_text,
+        source="whatsapp", delivery_address=address,
+    )
 
     summary = "\n".join(lines)
-    reply = f"Order received! 🧾\n\n{summary}\n\n*Total: ₹{order['total']:.0f}*"
+    header = _t(lang, "Order received! 🧾", "ऑर्डर मिल गया! 🧾")
+    reply = f"{header}\n\n{summary}\n\n*{_t(lang,'Total','कुल')}: ₹{order['total']:.0f}*"
     if unavailable:
-        reply += f"\n\n(Sorry, not available right now: {', '.join(unavailable)})"
-    await send_text(from_number, reply)
+        reply += "\n\n" + _t(
+            lang,
+            f"(Sorry, not available right now: {', '.join(unavailable)})",
+            f"(माफ़ करें, अभी उपलब्ध नहीं: {', '.join(unavailable)})",
+        )
+    if order.get("is_duplicate_flag"):
+        reply += "\n\n" + _t(
+            lang,
+            "⚠️ Looks like you just ordered again — if this wasn't intentional, reply 'cancel' to cancel this one.",
+            "⚠️ लगता है आपने अभी दोबारा ऑर्डर किया — अगर गलती से हुआ है तो 'cancel' लिखें।",
+        )
+    await send_text(to, reply)
+
+    if not address:
+        await send_text(to, _t(
+            lang,
+            "📍 What's your delivery address? (Or reply 'pickup' if you'll collect it yourself.)",
+            "📍 आपका डिलीवरी पता क्या है? (खुद लेने आना है तो 'pickup' लिखें।)",
+        ))
+    else:
+        eta = order.get("eta_minutes")
+        if eta:
+            await send_text(to, _t(
+                lang, f"🚴 Estimated delivery: ~{eta} minutes.",
+                f"🚴 अनुमानित डिलीवरी समय: ~{eta} मिनट।",
+            ))
 
     await send_buttons(
-        from_number,
-        "How would you like to pay?",
-        [("pay_upi", "Pay via UPI"), ("pay_cod", "Cash/UPI on delivery")],
+        to,
+        _t(lang, "How would you like to pay?", "भुगतान कैसे करेंगे?"),
+        [("pay_upi", _t(lang, "Pay via UPI", "UPI से भुगतान")),
+         ("pay_cod", _t(lang, "Cash on delivery", "डिलीवरी पर नकद"))],
     )
 
 
-async def handle_button_reply(from_number: str, button_id: str) -> None:
-    customer = get_or_create_customer(from_number)
-    order = get_latest_open_order_for_customer(customer["id"])
+async def _handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None:
+    order = svc.get_latest_open_order_for_customer(customer["id"])
     if not order:
-        await send_text(from_number, "I couldn't find an open order — please send your order again.")
+        await send_text(to, _t(
+            lang,
+            "You don't have an open order to edit. Send a new order anytime!",
+            "आपका कोई खुला ऑर्डर नहीं है। नया ऑर्डर कभी भी भेजें!",
+        ))
+        return
+
+    menu = svc.get_available_menu()
+    matched = svc.match_products([i["product_name"] for i in parsed["items"]], menu)
+    changes = []
+    new_total = order["total"]
+
+    for item in parsed["items"]:
+        product = matched.get(item["product_name"])
+        if not product:
+            continue
+        qty = float(item["quantity"])
+        action = item.get("action", "add")
+        if action == "remove":
+            new_total = svc.remove_item_from_order(order["id"], product["name_en"])
+            changes.append(_t(lang, f"Removed {product['name_en']}", f"{product['name_en']} हटाया गया"))
+        else:
+            new_total = svc.add_item_to_order(order["id"], product, qty)
+            changes.append(_t(lang, f"Added {qty} {product['unit']} {product['name_en']}",
+                               f"{qty} {product['unit']} {product['name_en']} जोड़ा गया"))
+
+    if not changes:
+        await send_text(to, _t(lang, "Couldn't match that item to your order.", "वह आइटम ऑर्डर में नहीं मिला।"))
+        return
+
+    reply = "\n".join(f"✅ {c}" for c in changes)
+    reply += f"\n\n*{_t(lang,'New total','नया कुल')}: ₹{new_total:.0f}*"
+    await send_text(to, reply)
+
+
+async def _handle_cancel(to: str, customer: dict, lang: str) -> None:
+    order = svc.get_latest_open_order_for_customer(customer["id"])
+    if not order:
+        await send_text(to, _t(lang, "You don't have an active order to cancel.", "आपका कोई सक्रिय ऑर्डर नहीं है।"))
+        return
+    svc.cancel_order(order["id"])
+    await send_text(to, _t(
+        lang, f"Order #{order['id']} has been cancelled. No charge.",
+        f"ऑर्डर #{order['id']} रद्द कर दिया गया है। कोई शुल्क नहीं।",
+    ))
+
+
+async def _handle_reorder(to: str, customer: dict, lang: str) -> None:
+    last = svc.get_latest_order_for_customer(customer["id"])
+    if not last or not last.get("order_items"):
+        await send_text(to, _t(lang, "You don't have a previous order to repeat.", "आपका कोई पिछला ऑर्डर नहीं मिला।"))
+        return
+
+    menu = svc.get_available_menu()
+    available_ids = {p["id"] for p in menu}
+    items_for_order = []
+    lines = []
+    skipped = []
+    for it in last["order_items"]:
+        if it["product_id"] not in available_ids:
+            skipped.append(it["product_name"])
+            continue
+        product = next(p for p in menu if p["id"] == it["product_id"])
+        qty = float(it["quantity"])
+        items_for_order.append({"product": product, "quantity": qty})
+        lines.append(f"• {product['name_en']} — {qty} {product['unit']} × ₹{product['price']} = ₹{product['price']*qty:.0f}")
+
+    if not items_for_order:
+        await send_text(to, _t(lang, "Sorry, those items aren't available today.", "माफ़ करें, वे आइटम आज उपलब्ध नहीं हैं।"))
+        return
+
+    order = svc.create_order(
+        customer["id"], items_for_order, raw_message="(reorder)",
+        source="whatsapp", delivery_address=customer.get("address") or "",
+    )
+    summary = "\n".join(lines)
+    reply = f"{_t(lang,'Repeating your last order! 🔁','आपका पिछला ऑर्डर दोहराया जा रहा है! 🔁')}\n\n{summary}\n\n*{_t(lang,'Total','कुल')}: ₹{order['total']:.0f}*"
+    if skipped:
+        reply += "\n\n" + _t(lang, f"(No longer available: {', '.join(skipped)})", f"(अब उपलब्ध नहीं: {', '.join(skipped)})")
+    await send_text(to, reply)
+
+    await send_buttons(
+        to,
+        _t(lang, "How would you like to pay?", "भुगतान कैसे करेंगे?"),
+        [("pay_upi", _t(lang, "Pay via UPI", "UPI से भुगतान")),
+         ("pay_cod", _t(lang, "Cash on delivery", "डिलीवरी पर नकद"))],
+    )
+
+
+async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> None:
+    address = parsed.get("address_text", "").strip()
+    if not address:
+        await send_text(to, _t(lang, "Please share your delivery address.", "कृपया अपना डिलीवरी पता भेजें।"))
+        return
+    svc.set_customer_address(customer["id"], address)
+
+    # if they have an open order without an address snapshot yet, attach it
+    order = svc.get_latest_open_order_for_customer(customer["id"])
+    if order and not order.get("delivery_address"):
+        from app.db import get_db
+        get_db().table("orders").update({"delivery_address": address}).eq("id", order["id"]).execute()
+
+    await send_text(to, _t(lang, f"Got it — saved your address: {address}", f"ठीक है — पता सेव कर लिया: {address}"))
+
+
+async def handle_button_reply(from_number: str, button_id: str) -> None:
+    customer = svc.get_or_create_customer(from_number)
+    lang = customer.get("preferred_language") or "en"
+    order = svc.get_latest_open_order_for_customer(customer["id"])
+    if not order:
+        await send_text(from_number, _t(lang, "Couldn't find an open order — please send your order again.", "कोई खुला ऑर्डर नहीं मिला — कृपया दोबारा भेजें।"))
         return
 
     if button_id == "pay_upi":
-        set_order_payment_mode(order["id"], "upi")
+        svc.set_order_payment_mode(order["id"], "upi")
         link = build_upi_link(order["total"], order["id"])
-        await send_text(
-            from_number,
-            f"Tap to pay ₹{order['total']:.0f} via UPI:\n{link}\n\n"
-            "Once paid, we'll confirm and start preparing your order. 🙏",
-        )
+        await send_text(from_number, _t(
+            lang,
+            f"Tap to pay ₹{order['total']:.0f} via UPI:\n{link}\n\nOnce paid, we'll confirm and start preparing your order. 🙏",
+            f"₹{order['total']:.0f} UPI से भुगतान करने के लिए टैप करें:\n{link}\n\nभुगतान होते ही हम आपका ऑर्डर तैयार करना शुरू कर देंगे 🙏",
+        ))
     elif button_id == "pay_cod":
-        set_order_payment_mode(order["id"], "cod")
-        await send_text(
-            from_number,
+        svc.set_order_payment_mode(order["id"], "cod")
+        await send_text(from_number, _t(
+            lang,
             f"Got it — pay cash or UPI on delivery. Your order (₹{order['total']:.0f}) is confirmed! "
-            f"We'll deliver between 7 AM – 10 PM. For anything urgent, call {SHOP_WHATSAPP_DISPLAY_NUMBER}.",
-        )
-
-
-async def send_menu(to: str) -> None:
-    menu = get_available_menu()
-    lines = [f"🍉 *{SHOP_NAME} — Today's Menu*\n"]
-    for p in menu:
-        hi = f" ({p['name_hi']})" if p.get("name_hi") else ""
-        lines.append(f"• {p['name_en']}{hi} — ₹{p['price']}/{p['unit']}")
-    lines.append("\nJust reply with what you'd like, e.g. '2kg mango, 1 dozen banana'.")
-    await send_text(to, "\n".join(lines))
+            f"For anything urgent, call {SHOP_WHATSAPP_DISPLAY_NUMBER}.",
+            f"ठीक है — डिलीवरी पर नकद/UPI भुगतान करें। आपका ऑर्डर (₹{order['total']:.0f}) कन्फ़र्म हो गया है! "
+            f"किसी भी ज़रूरी बात के लिए कॉल करें: {SHOP_WHATSAPP_DISPLAY_NUMBER}.",
+        ))
+        svc.set_order_status(order["id"], "confirmed")

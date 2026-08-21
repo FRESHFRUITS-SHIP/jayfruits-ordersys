@@ -3,13 +3,14 @@ from starlette.middleware.sessions import SessionMiddleware
 from fastapi.responses import RedirectResponse, HTMLResponse
 
 from app.config import DASHBOARD_SECRET_KEY, SHOP_NAME
-from app.routers import webhook, dashboard
+from app.routers import webhook, dashboard, customer_page
 
 app = FastAPI(title="Jay Fruit's — WhatsApp Order System")
 app.add_middleware(SessionMiddleware, secret_key=DASHBOARD_SECRET_KEY)
 
 app.include_router(webhook.router)
 app.include_router(dashboard.router)
+app.include_router(customer_page.router)
 
 
 @app.get("/")
@@ -20,6 +21,34 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/tasks/daily-summary")
+async def trigger_daily_summary():
+    """
+    Sends today's summary (orders, revenue, best-seller) to the shop owner's
+    WhatsApp number. Call this once a day — e.g. from a free cron service like
+    cron-job.org hitting this URL every evening, or Railway's Cron Jobs feature.
+    Not scheduled automatically inside the app itself (keeps the app simple and
+    stateless); wire up an external scheduler pointed at this endpoint.
+    """
+    from app.services import orders as svc
+    from app.services.whatsapp import send_text
+    from app.config import SHOP_WHATSAPP_DISPLAY_NUMBER
+
+    data = svc.get_analytics(days=1)
+    best = data["best_sellers"][0][0] if data["best_sellers"] else "—"
+    text = (
+        f"📊 *Daily Summary — {SHOP_NAME}*\n\n"
+        f"Orders today: {data['total_orders']}\n"
+        f"Revenue: ₹{data['total_revenue']:.0f}\n"
+        f"Profit: ₹{data['total_profit']:.0f}\n"
+        f"Top seller: {best}"
+    )
+    owner_number = SHOP_WHATSAPP_DISPLAY_NUMBER.replace(" ", "").replace("+", "")
+    if owner_number:
+        await send_text(owner_number, text)
+    return {"status": "sent", "summary": data}
 
 
 @app.get("/privacy", response_class=HTMLResponse)

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ shop_name }} — Customers</title>
+<style>
+  :root{ --green:#1F4D36; --orange:#FF6A3D; --cream:#FFF8ED; }
+  *{box-sizing:border-box;}
+  body{ font-family: system-ui, sans-serif; background:#F7F4EC; margin:0; }
+  header{ background:var(--green); color:var(--cream); padding:14px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; }
+  header h1{ font-size:16px; margin:0; }
+  nav a{ color:var(--cream); text-decoration:none; font-size:12px; margin-left:10px; }
+  .wrap{ max-width:800px; margin:0 auto; padding:16px; }
+  table{ width:100%; border-collapse:collapse; background:white; border-radius:10px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); }
+  th, td{ padding:10px; text-align:left; font-size:13px; border-bottom:1px solid #eee; }
+  th{ background:#FFF3E2; color:var(--green); font-size:11px; text-transform:uppercase; }
+  a.row-link{ color:var(--orange); text-decoration:none; font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ shop_name }} — Customers</h1>
+  <nav><a href="/orders">Orders</a><a href="/products">Menu</a><a href="/analytics">Analytics</a><a href="/settings">Settings</a></nav>
+</header>
+<div class="wrap">
+  <table>
+    <thead><tr><th>Number</th><th>Address</th><th>Orders</th><th>Total spend</th><th></th></tr></thead>
+    <tbody>
+      {% for c in customers %}
+      <tr>
+        <td>{{ c.wa_number }}</td>
+        <td>{{ c.address or '—' }}</td>
+        <td>{{ c.order_count }}</td>
+        <td>₹{{ "%.0f"|format(c.total_spend) }}</td>
+        <td><a class="row-link" href="/customers/{{ c.id }}">View →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+</body>
+</html>

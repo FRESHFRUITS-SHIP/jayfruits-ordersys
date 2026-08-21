@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ shop_name }} — Customer</title>
+<style>
+  :root{ --green:#1F4D36; --orange:#FF6A3D; --cream:#FFF8ED; }
+  *{box-sizing:border-box;}
+  body{ font-family: system-ui, sans-serif; background:#F7F4EC; margin:0; }
+  header{ background:var(--green); color:var(--cream); padding:14px 16px; display:flex; justify-content:space-between; align-items:center; }
+  header a{ color:var(--cream); text-decoration:none; font-size:13px; }
+  .wrap{ max-width:600px; margin:0 auto; padding:16px; }
+  .card{ background:white; border-radius:10px; padding:14px; margin-bottom:10px; box-shadow:0 1px 4px rgba(0,0,0,0.08); font-size:13px; }
+  .badge{ padding:3px 9px; border-radius:20px; font-size:11px; font-weight:700; }
+  .status-new{ background:#FFE3C2; color:#A85400; }
+  .status-confirmed{ background:#D6EAD8; color:#1F4D36; }
+  .status-out_for_delivery{ background:#D6E4F0; color:#1D4E8F; }
+  .status-delivered{ background:#DCF0DC; color:#1E6B1E; }
+  .status-cancelled{ background:#F0D6D6; color:#8F1D1D; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ customer.wa_number }}</h1>
+  <a href="/customers">← Back</a>
+</header>
+<div class="wrap">
+  <div class="card">
+    <b>Address:</b> {{ customer.address or '—' }}<br>
+    <b>Language:</b> {{ customer.preferred_language or 'en' }}<br>
+    <b>Since:</b> {{ customer.created_at[:10] }}
+  </div>
+  {% for o in orders %}
+  <div class="card">
+    <b>Order #{{ o.id }}</b> — <span class="badge status-{{ o.status }}">{{ o.status.replace('_',' ') }}</span>
+    <div style="margin-top:6px;">
+      {% for it in o.order_items %}{{ it.product_name }} × {{ it.quantity }} {{ it.unit }}<br>{% endfor %}
+    </div>
+    <div style="margin-top:6px; font-weight:700;">₹{{ "%.0f"|format(o.total) }}</div>
+  </div>
+  {% endfor %}
+</div>
+</body>
+</html>
