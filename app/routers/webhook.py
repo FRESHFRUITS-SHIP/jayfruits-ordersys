@@ -53,6 +53,7 @@ async def receive_message(request: Request):
 
         msg = messages[0]
         from_number = msg["from"]
+        print(f"📩 Incoming message from: {from_number}")  # DEBUG: remove once allow-list issue is resolved
 
         if msg["type"] == "text":
             await handle_text_message(from_number, msg["text"]["body"])
