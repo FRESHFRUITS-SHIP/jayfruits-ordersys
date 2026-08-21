@@ -8,7 +8,7 @@ HEADERS = {
 
 
 async def send_text(to: str, body: str) -> None:
-    """Send a plain text WhatsApp message. `to` is the customer's number, e.g. 919876543210."""
+    """Send a plain text WhatsApp message. `to` is the customer's number, e.g. 919967512579."""
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
