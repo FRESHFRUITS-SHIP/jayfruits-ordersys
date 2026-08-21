@@ -43,3 +43,15 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> No
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(WHATSAPP_API_URL, headers=HEADERS, json=payload)
         r.raise_for_status()
+async def send_text(to: str, body: str) -> None:
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": body, "preview_url": False},
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(WHATSAPP_API_URL, headers=HEADERS, json=payload)
+        if r.status_code >= 400:
+            print(f"WhatsApp API error {r.status_code}: {r.text}")
+        r.raise_for_status()
