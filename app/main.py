@@ -17,10 +17,13 @@ app.include_router(customer_page.router)
 async def root():
     return RedirectResponse(url="/orders")
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+@app.get("/debug/secret-check")
+async def debug_secret_check():
+    from app.config import META_APP_SECRET
+    return {
+        "app_secret_is_empty": META_APP_SECRET == "",
+        "app_secret_length": len(META_APP_SECRET),
+    }
 
 
 @app.post("/tasks/daily-summary")
