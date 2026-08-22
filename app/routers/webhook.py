@@ -53,7 +53,6 @@ async def receive_message(request: Request):
 
         msg = messages[0]
         from_number = msg["from"]
-        print(f"📩 Incoming message from: {from_number}")  # DEBUG: remove once allow-list issue is resolved
 
         if msg["type"] == "text":
             await handle_text_message(from_number, msg["text"]["body"])
@@ -81,6 +80,23 @@ def _t(lang: str, en: str, hi: str) -> str:
     return hi if lang == "hi" else en
 
 
+def _fmt_qty(qty: float) -> str:
+    """Formats 2.0 -> '2', 1.5 -> '1.5' — avoids the sloppy '2.0 kg' look."""
+    return str(int(qty)) if qty == int(qty) else str(qty)
+
+
+ACKNOWLEDGEMENT_WORDS = {
+    "thank you", "thanks", "thankyou", "thnx", "ty", "tq",
+    "ok", "okay", "k", "cool", "great", "nice", "good", "perfect",
+    "dhanyavad", "shukriya", "theek hai", "thik hai",
+}
+
+PICKUP_WORDS = {
+    "pickup", "pick up", "self pickup", "i'll pick up", "ill pick up",
+    "i will pick up", "self pick up", "pick-up",
+}
+
+
 async def _greeting_and_menu(to: str, lang: str) -> None:
     menu = svc.get_available_menu()
     if lang == "hi":
@@ -104,14 +120,47 @@ async def _send_menu_link(to: str, customer: dict) -> None:
     await send_text(to, f"🔗 Your menu & order history: {link}")
 
 
+async def _send_payment_buttons(to: str, lang: str) -> None:
+    await send_buttons(
+        to,
+        _t(lang, "How would you like to pay?", "भुगतान कैसे करेंगे?"),
+        [("pay_upi", _t(lang, "Pay via UPI", "UPI से भुगतान")),
+         ("pay_cod", _t(lang, "Cash on delivery", "डिलीवरी पर नकद"))],
+    )
+
+
 # ---------- main conversation handler ----------
 async def handle_text_message(from_number: str, text: str) -> None:
     customer = svc.get_or_create_customer(from_number)
-    stripped = text.strip().lower()
+    stripped = text.strip().lower().strip(".!😊🙏👍")
 
     if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
         lang = customer.get("preferred_language") or "en"
         await _greeting_and_menu(from_number, lang)
+        return
+
+    if stripped in ACKNOWLEDGEMENT_WORDS:
+        lang = customer.get("preferred_language") or "en"
+        await send_text(from_number, _t(lang, "You're welcome! 😊", "आपका स्वागत है! 😊"))
+        return
+
+    if stripped in PICKUP_WORDS:
+        lang = customer.get("preferred_language") or "en"
+        order = svc.get_latest_open_order_for_customer(customer["id"])
+        if order:
+            svc.set_order_fulfillment(order["id"], "pickup")
+            await send_text(from_number, _t(
+                lang,
+                f"Got it — order #{order['id']} will be ready for you to pick up. See you soon! 🙏",
+                f"ठीक है — ऑर्डर #{order['id']} पिकअप के लिए तैयार रहेगा। मिलते हैं! 🙏",
+            ))
+            if order.get("payment_mode", "unset") == "unset":
+                await _send_payment_buttons(from_number, lang)
+        else:
+            await send_text(from_number, _t(
+                lang, "You don't have an open order right now — send your order first!",
+                "अभी आपका कोई खुला ऑर्डर नहीं है — पहले ऑर्डर भेजें!",
+            ))
         return
 
     menu = svc.get_available_menu()
@@ -124,6 +173,13 @@ async def handle_text_message(from_number: str, text: str) -> None:
         customer["preferred_language"] = lang
 
     intent = parsed["intent"]
+
+    # Backup net: if Groq still classifies a short acknowledgement/thanks as
+    # "greeting", don't re-send the whole menu — a full menu reply to "thanks"
+    # is exactly the kind of thing that makes a bot feel dumb.
+    if intent == "greeting" and len(stripped.split()) <= 3 and stripped not in ("hi", "hello", "hey", "menu"):
+        await send_text(from_number, _t(lang, "You're welcome! 😊", "आपका स्वागत है! 😊"))
+        return
 
     if intent == "greeting":
         await _greeting_and_menu(from_number, lang)
@@ -149,7 +205,22 @@ async def handle_text_message(from_number: str, text: str) -> None:
         await _handle_new_order(from_number, customer, parsed, text, lang)
         return
 
-    # "other" — unclear message
+    # "other" — unclear message. Before giving up, check: are we mid-conversation
+    # waiting on this customer's delivery address? If so, treat their reply as
+    # the address rather than making them re-phrase it as "deliver to ...".
+    open_order = svc.get_latest_open_order_for_customer(customer["id"])
+    if open_order and open_order.get("fulfillment") == "delivery" and not open_order.get("delivery_address") and not customer.get("address"):
+        svc.set_customer_address(customer["id"], text.strip())
+        from app.db import get_db
+        get_db().table("orders").update({"delivery_address": text.strip()}).eq("id", open_order["id"]).execute()
+        await send_text(from_number, _t(
+            lang, f"Got it — saved your address: {text.strip()}",
+            f"ठीक है — पता सेव कर लिया: {text.strip()}",
+        ))
+        if open_order.get("payment_mode", "unset") == "unset":
+            await _send_payment_buttons(from_number, lang)
+        return
+
     note = parsed.get("note") or ""
     reply = _t(
         lang,
@@ -186,7 +257,7 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
         qty = float(item["quantity"])
         items_for_order.append({"product": product, "quantity": qty})
         line_total = product["price"] * qty
-        lines.append(f"• {product['name_en']} — {qty} {product['unit']} × ₹{product['price']} = ₹{line_total:.0f}")
+        lines.append(f"• {product['name_en']} — {_fmt_qty(qty)} {product['unit']} × ₹{product['price']} = ₹{line_total:.0f}")
 
     unavailable = parsed.get("unavailable_items", [])
 
@@ -235,25 +306,30 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
     await send_text(to, reply)
 
     if not address:
+        # Address is required before we move to payment — don't send payment
+        # buttons yet. The next message from this customer (whether it looks
+        # like an address or not) gets picked up by the address-capture logic
+        # in handle_text_message, which then sends payment buttons itself.
         await send_text(to, _t(
             lang,
             "📍 What's your delivery address? (Or reply 'pickup' if you'll collect it yourself.)",
             "📍 आपका डिलीवरी पता क्या है? (खुद लेने आना है तो 'pickup' लिखें।)",
         ))
-    else:
-        eta = order.get("eta_minutes")
-        if eta:
-            await send_text(to, _t(
-                lang, f"🚴 Estimated delivery: ~{eta} minutes.",
-                f"🚴 अनुमानित डिलीवरी समय: ~{eta} मिनट।",
-            ))
+        return
 
-    await send_buttons(
-        to,
-        _t(lang, "How would you like to pay?", "भुगतान कैसे करेंगे?"),
-        [("pay_upi", _t(lang, "Pay via UPI", "UPI से भुगतान")),
-         ("pay_cod", _t(lang, "Cash on delivery", "डिलीवरी पर नकद"))],
-    )
+    # Address already on file — mention it and go straight to payment.
+    await send_text(to, _t(
+        lang, f"📍 Delivering to: {address}\n(Reply 'change address' anytime to update this.)",
+        f"📍 डिलीवरी पता: {address}\n(पता बदलने के लिए कभी भी 'change address' लिखें।)",
+    ))
+    eta = order.get("eta_minutes")
+    if eta:
+        await send_text(to, _t(
+            lang, f"🚴 Estimated delivery: ~{eta} minutes.",
+            f"🚴 अनुमानित डिलीवरी समय: ~{eta} मिनट।",
+        ))
+
+    await _send_payment_buttons(to, lang)
 
 
 async def _handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None:
@@ -282,8 +358,8 @@ async def _handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None
             changes.append(_t(lang, f"Removed {product['name_en']}", f"{product['name_en']} हटाया गया"))
         else:
             new_total = svc.add_item_to_order(order["id"], product, qty)
-            changes.append(_t(lang, f"Added {qty} {product['unit']} {product['name_en']}",
-                               f"{qty} {product['unit']} {product['name_en']} जोड़ा गया"))
+            changes.append(_t(lang, f"Added {_fmt_qty(qty)} {product['unit']} {product['name_en']}",
+                               f"{_fmt_qty(qty)} {product['unit']} {product['name_en']} जोड़ा गया"))
 
     if not changes:
         await send_text(to, _t(lang, "Couldn't match that item to your order.", "वह आइटम ऑर्डर में नहीं मिला।"))
@@ -324,7 +400,7 @@ async def _handle_reorder(to: str, customer: dict, lang: str) -> None:
         product = next(p for p in menu if p["id"] == it["product_id"])
         qty = float(it["quantity"])
         items_for_order.append({"product": product, "quantity": qty})
-        lines.append(f"• {product['name_en']} — {qty} {product['unit']} × ₹{product['price']} = ₹{product['price']*qty:.0f}")
+        lines.append(f"• {product['name_en']} — {_fmt_qty(qty)} {product['unit']} × ₹{product['price']} = ₹{product['price']*qty:.0f}")
 
     if not items_for_order:
         await send_text(to, _t(lang, "Sorry, those items aren't available today.", "माफ़ करें, वे आइटम आज उपलब्ध नहीं हैं।"))
@@ -340,12 +416,20 @@ async def _handle_reorder(to: str, customer: dict, lang: str) -> None:
         reply += "\n\n" + _t(lang, f"(No longer available: {', '.join(skipped)})", f"(अब उपलब्ध नहीं: {', '.join(skipped)})")
     await send_text(to, reply)
 
-    await send_buttons(
-        to,
-        _t(lang, "How would you like to pay?", "भुगतान कैसे करेंगे?"),
-        [("pay_upi", _t(lang, "Pay via UPI", "UPI से भुगतान")),
-         ("pay_cod", _t(lang, "Cash on delivery", "डिलीवरी पर नकद"))],
-    )
+    address = customer.get("address") or ""
+    if not address:
+        await send_text(to, _t(
+            lang,
+            "📍 What's your delivery address? (Or reply 'pickup' if you'll collect it yourself.)",
+            "📍 आपका डिलीवरी पता क्या है? (खुद लेने आना है तो 'pickup' लिखें।)",
+        ))
+        return
+
+    await send_text(to, _t(
+        lang, f"📍 Delivering to: {address}",
+        f"📍 डिलीवरी पता: {address}",
+    ))
+    await _send_payment_buttons(to, lang)
 
 
 async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> None:
@@ -356,12 +440,17 @@ async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> N
     svc.set_customer_address(customer["id"], address)
 
     # if they have an open order without an address snapshot yet, attach it
+    # and — if payment hasn't been chosen yet — move them straight to payment.
     order = svc.get_latest_open_order_for_customer(customer["id"])
-    if order and not order.get("delivery_address"):
+    was_missing_address = order and not order.get("delivery_address")
+    if order and was_missing_address:
         from app.db import get_db
         get_db().table("orders").update({"delivery_address": address}).eq("id", order["id"]).execute()
 
     await send_text(to, _t(lang, f"Got it — saved your address: {address}", f"ठीक है — पता सेव कर लिया: {address}"))
+
+    if order and was_missing_address and order.get("payment_mode", "unset") == "unset":
+        await _send_payment_buttons(to, lang)
 
 
 async def handle_button_reply(from_number: str, button_id: str) -> None:
