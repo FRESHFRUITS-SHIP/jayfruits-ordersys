@@ -6,8 +6,8 @@ from app.config import (
     META_VERIFY_TOKEN, META_APP_SECRET, SHOP_NAME,
     SHOP_WHATSAPP_DISPLAY_NUMBER, PUBLIC_BASE_URL,
 )
-from app.services.whatsapp import send_text, send_buttons
-from app.services.order_parser import parse_message
+from app.services.whatsapp import send_text, send_buttons, send_list_menu
+from app.services.order_parser import parse_message, parse_quantity_only
 from app.services.upi import build_upi_link
 from app.services import orders as svc
 
@@ -98,21 +98,33 @@ PICKUP_WORDS = {
 
 
 async def _greeting_and_menu(to: str, lang: str) -> None:
-    menu = svc.get_available_menu()
-    if lang == "hi":
-        lines = [f"🍉 *{SHOP_NAME} में आपका स्वागत है!*\n"]
-        for p in menu:
-            hi_name = f" ({p['name_hi']})" if p.get("name_hi") else ""
-            lines.append(f"• {p['name_en']}{hi_name} — ₹{p['price']}/{p['unit']}")
-        lines.append("\nजो चाहिए वो लिखें, जैसे: '2kg mango, 1 dozen banana'")
-        lines.append(f"अपना मेन्यू व ऑर्डर हिस्ट्री यहाँ देखें: {PUBLIC_BASE_URL}/me/<link नीचे भेजा जाएगा>")
-    else:
-        lines = [f"🍉 *Welcome to {SHOP_NAME}!*\n"]
-        for p in menu:
-            hi_name = f" ({p['name_hi']})" if p.get("name_hi") else ""
-            lines.append(f"• {p['name_en']}{hi_name} — ₹{p['price']}/{p['unit']}")
-        lines.append("\nJust reply with what you'd like, e.g. '2kg mango, 1 dozen banana'.")
-    await send_text(to, "\n".join(lines))
+    # Any pending "kitna chahiye?" flow is stale once someone re-greets — clear it
+    # so we don't end up mis-parsing "hi" as a quantity reply later.
+    customer = svc.get_or_create_customer(to)
+    if customer.get("pending_item"):
+        svc.clear_pending_item(customer["id"])
+
+    top_items = svc.get_top_selling_or_seasonal(limit=4)
+    names = ", ".join(p["name_en"] for p in top_items)
+
+    intro = _t(
+        lang,
+        f"🍉 Namaste! Welcome to {SHOP_NAME} — fresh fruits, daily. "
+        f"Aaj {names} bahut accha hai. What can I get you today?",
+        f"🍉 नमस्ते! {SHOP_NAME} में आपका स्वागत है — रोज़ ताज़े फल। "
+        f"आज {names} बहुत अच्छा है। आज क्या चाहिए?",
+    )
+    await send_text(to, intro)
+
+    sections = svc.build_menu_sections()
+    if sections:
+        await send_list_menu(
+            to,
+            body_text=_t(lang, "Tap below for today's full menu 👇", "आज का पूरा मेन्यू देखने के लिए नीचे टैप करें 👇"),
+            button_text=_t(lang, "View Menu", "मेन्यू देखें"),
+            sections=sections,
+            footer=_t(lang, "Or just type what you'd like", "या सीधे लिख कर बताएं"),
+        )
 
 
 async def _send_menu_link(to: str, customer: dict) -> None:
@@ -162,6 +174,32 @@ async def handle_text_message(from_number: str, text: str) -> None:
                 "अभी आपका कोई खुला ऑर्डर नहीं है — पहले ऑर्डर भेजें!",
             ))
         return
+
+    # ---- pending "kitna chahiye?" flow: this message is expected to be just a quantity ----
+    pending = customer.get("pending_item")
+    if pending:
+        lang = customer.get("preferred_language") or "en"
+        qty = parse_quantity_only(text)
+        if qty:
+            svc.clear_pending_item(customer["id"])
+            menu = svc.get_available_menu()
+            fake_parsed = {
+                "intent": "new_order",
+                "language": lang,
+                "items": [{"product_name": pending["name_en"], "quantity": qty, "unit": pending["unit"], "action": "add"}],
+                "unavailable_items": [],
+                "address_text": "",
+                "note": "",
+            }
+            await _handle_new_order(from_number, customer, fake_parsed, text, lang)
+            return
+        else:
+            await send_text(from_number, _t(
+                lang,
+                f"Sorry, didn't catch that — how much {pending['name_en']} would you like? (e.g. 2 {pending['unit']})",
+                f"माफ़ करें, समझ नहीं आया — कितना {pending['name_en']} चाहिए? (जैसे 2 {pending['unit']})",
+            ))
+            return
 
     menu = svc.get_available_menu()
     parsed = parse_message(text, menu)
@@ -248,13 +286,38 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
 
     menu = svc.get_available_menu()
     matched = svc.match_products([i["product_name"] for i in parsed["items"]], menu)
+
+    # ---- single item, no quantity given -> ask "kitna chahiye?" and pause ----
+    items_missing_qty = [i for i in parsed["items"] if i.get("quantity") in (None, "", 0)]
+    if items_missing_qty and len(parsed["items"]) == 1:
+        item = items_missing_qty[0]
+        product = matched.get(item["product_name"])
+        if product:
+            svc.set_pending_item(customer["id"], product)
+            await send_text(to, _t(
+                lang,
+                f"{product['name_en']} — kitna chahiye? (e.g. 2 {product['unit']})",
+                f"{product['name_en']} — कितना चाहिए? (जैसे 2 {product['unit']})",
+            ))
+            return
+
     items_for_order = []
     lines = []
     for item in parsed["items"]:
         product = matched.get(item["product_name"])
         if not product:
             continue
-        qty = float(item["quantity"])
+        qty = item.get("quantity")
+        if qty in (None, "", 0):
+            # multi-item message with a missing quantity somewhere — don't guess,
+            # ask the customer to resend with quantities for everything.
+            await send_text(to, _t(
+                lang,
+                "Could you tell me the quantity for each item? e.g. '2kg mango, 1 dozen banana'",
+                "कृपया हर आइटम की मात्रा बताएं, जैसे: '2kg mango, 1 dozen banana'",
+            ))
+            return
+        qty = float(qty)
         items_for_order.append({"product": product, "quantity": qty})
         line_total = product["price"] * qty
         lines.append(f"• {product['name_en']} — {_fmt_qty(qty)} {product['unit']} × ₹{product['price']} = ₹{line_total:.0f}")
@@ -306,10 +369,6 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
     await send_text(to, reply)
 
     if not address:
-        # Address is required before we move to payment — don't send payment
-        # buttons yet. The next message from this customer (whether it looks
-        # like an address or not) gets picked up by the address-capture logic
-        # in handle_text_message, which then sends payment buttons itself.
         await send_text(to, _t(
             lang,
             "📍 What's your delivery address? (Or reply 'pickup' if you'll collect it yourself.)",
@@ -317,7 +376,6 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
         ))
         return
 
-    # Address already on file — mention it and go straight to payment.
     await send_text(to, _t(
         lang, f"📍 Delivering to: {address}\n(Reply 'change address' anytime to update this.)",
         f"📍 डिलीवरी पता: {address}\n(पता बदलने के लिए कभी भी 'change address' लिखें।)",
@@ -351,7 +409,7 @@ async def _handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None
         product = matched.get(item["product_name"])
         if not product:
             continue
-        qty = float(item["quantity"])
+        qty = float(item.get("quantity") or 1)
         action = item.get("action", "add")
         if action == "remove":
             new_total = svc.remove_item_from_order(order["id"], product["name_en"])
@@ -439,8 +497,6 @@ async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> N
         return
     svc.set_customer_address(customer["id"], address)
 
-    # if they have an open order without an address snapshot yet, attach it
-    # and — if payment hasn't been chosen yet — move them straight to payment.
     order = svc.get_latest_open_order_for_customer(customer["id"])
     was_missing_address = order and not order.get("delivery_address")
     if order and was_missing_address:
@@ -456,6 +512,25 @@ async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> N
 async def handle_button_reply(from_number: str, button_id: str) -> None:
     customer = svc.get_or_create_customer(from_number)
     lang = customer.get("preferred_language") or "en"
+
+    # ---- tapped a product row from the List Message ----
+    if button_id.startswith("prod_"):
+        try:
+            product_id = int(button_id.split("_", 1)[1])
+        except ValueError:
+            return
+        product = svc.get_product_by_id(product_id)
+        if not product:
+            await send_text(from_number, _t(lang, "Sorry, that item isn't available anymore.", "माफ़ करें, वह आइटम अब उपलब्ध नहीं है।"))
+            return
+        svc.set_pending_item(customer["id"], product)
+        await send_text(from_number, _t(
+            lang,
+            f"{product['name_en']} — kitna chahiye? (e.g. 2 {product['unit']})",
+            f"{product['name_en']} — कितना चाहिए? (जैसे 2 {product['unit']})",
+        ))
+        return
+
     order = svc.get_latest_open_order_for_customer(customer["id"])
     if not order:
         await send_text(from_number, _t(lang, "Couldn't find an open order — please send your order again.", "कोई खुला ऑर्डर नहीं मिला — कृपया दोबारा भेजें।"))

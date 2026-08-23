@@ -4,6 +4,7 @@ matched against the shop's actual product list (so it can't invent items or
 prices — it can only pick from what's really on the menu).
 """
 import json
+import re
 from groq import Groq
 from app.config import GROQ_API_KEY, GROQ_MODEL
 
@@ -29,7 +30,11 @@ romanized Hindi), "en" for English.
 For new_order or edit_order intents, extract items:
 - Only match items that exist in the given menu. Anything not on the menu goes in "unavailable_items".
 - Quantities: interpret common Indian phrasing — "1 kg", "2 dozen", "adha kilo" (0.5 kg), "ek dozen"
-  (1 dozen), "5 pieces". If no unit given but the product's menu unit is "kg", assume kg.
+  (1 dozen), "5 pieces".
+- IMPORTANT: if the customer names a product WITHOUT stating any quantity at all (e.g. just "mango",
+  "banana chahiye", "I want apple"), set "quantity" to null. Do NOT assume or default a quantity —
+  the shop will ask the customer how much they want. Only fill in a quantity when the customer
+  actually stated one (a number, "half", "dozen", "some pieces", etc.).
 - For edit_order, each item needs an "action": "add" or "remove".
 - Never invent a price — prices come from the menu, not from you.
 
@@ -47,6 +52,14 @@ Respond with ONLY valid JSON, no markdown, no explanation, in this exact shape:
   "note": "short plain-English note if message had a question mixed in, else empty string"
 }
 """
+
+# Simple regex fallback for parsing a bare quantity reply like "2kg", "1 dozen", "3", "adha kilo"
+_QTY_PATTERNS = [
+    (re.compile(r"adha|आधा"), 0.5),
+    (re.compile(r"paun|पौन"), 0.75),
+    (re.compile(r"sava|सवा"), 1.25),
+]
+_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 
 def parse_message(customer_message: str, menu: list[dict]) -> dict:
@@ -82,6 +95,26 @@ def parse_message(customer_message: str, menu: list[dict]) -> dict:
     parsed.setdefault("address_text", "")
     parsed.setdefault("note", "")
     return parsed
+
+
+def parse_quantity_only(text: str) -> float | None:
+    """
+    Used when we've already asked 'kitna chahiye?' and are expecting just a
+    quantity reply, e.g. '2kg', '1 dozen', '3', 'adha kilo'. Cheap regex parse —
+    no need to spend a Groq call on a one-word reply.
+    """
+    t = text.strip().lower()
+    for pattern, value in _QTY_PATTERNS:
+        if pattern.search(t):
+            return value
+    match = _NUM_RE.search(t)
+    if match:
+        try:
+            val = float(match.group(1))
+            return val if val > 0 else None
+        except ValueError:
+            return None
+    return None
 
 
 def _fallback() -> dict:

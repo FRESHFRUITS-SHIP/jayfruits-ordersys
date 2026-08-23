@@ -28,6 +28,47 @@ def update_product(product_id: int, fields: dict) -> None:
     db.table("products").update(fields).eq("id", product_id).execute()
 
 
+def build_menu_sections(limit_per_section: int = 10) -> list[dict]:
+    """
+    Groups the available menu by `category` into WhatsApp List Message sections.
+    Meta caps this at 10 sections x 10 rows (100 rows total) — if a category has
+    more than `limit_per_section` items, only the first N are shown there today.
+    """
+    menu = get_available_menu()
+    grouped: dict[str, list[dict]] = {}
+    for p in menu:
+        cat = p.get("category") or "Fruits"
+        grouped.setdefault(cat, []).append(p)
+
+    sections = []
+    for category, items in grouped.items():
+        rows = [
+            {
+                "id": f"prod_{p['id']}",
+                "title": p["name_en"][:24],
+                "description": f"₹{p['price']}/{p['unit']}"[:72],
+            }
+            for p in items[:limit_per_section]
+        ]
+        if rows:
+            sections.append({"title": category[:24], "rows": rows})
+        if len(sections) == 10:
+            break
+    return sections
+
+
+def get_top_selling_or_seasonal(limit: int = 5) -> list[dict]:
+    """A handful of items to namedrop in a friendly intro line, instead of the full menu."""
+    menu = get_available_menu()
+    return menu[:limit]
+
+
+def get_product_by_id(product_id: int) -> dict | None:
+    db = get_db()
+    res = db.table("products").select("*").eq("id", product_id).execute()
+    return res.data[0] if res.data else None
+
+
 # ---------- shop settings ----------
 
 def get_shop_settings() -> dict:
@@ -83,6 +124,20 @@ def set_customer_address(customer_id: int, address: str) -> None:
 
 def set_customer_language(customer_id: int, lang: str) -> None:
     update_customer(customer_id, {"preferred_language": lang})
+
+
+def set_pending_item(customer_id: int, product: dict) -> None:
+    """Stash the product a customer named without a quantity, so the next message
+    (assumed to be just a quantity, e.g. '2kg') can complete the order."""
+    update_customer(customer_id, {"pending_item": {
+        "product_id": product["id"],
+        "name_en": product["name_en"],
+        "unit": product["unit"],
+    }})
+
+
+def clear_pending_item(customer_id: int) -> None:
+    update_customer(customer_id, {"pending_item": None})
 
 
 def get_all_customers_with_stats() -> list[dict]:
@@ -280,6 +335,14 @@ def set_order_status(order_id: int, status: str) -> None:
     db = get_db()
     db.table("orders").update({
         "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", order_id).execute()
+
+
+def set_order_fulfillment(order_id: int, fulfillment: str) -> None:
+    db = get_db()
+    db.table("orders").update({
+        "fulfillment": fulfillment,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", order_id).execute()
 
