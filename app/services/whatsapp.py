@@ -49,6 +49,24 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> No
         r.raise_for_status()
 
 
+async def send_image(to: str, image_url: str, caption: str | None = None) -> None:
+    """Send an image message — e.g. a shop banner for the greeting, or a product photo."""
+    image_obj = {"link": image_url}
+    if caption:
+        image_obj["caption"] = caption
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": image_obj,
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(WHATSAPP_API_URL, headers=HEADERS, json=payload)
+        if r.status_code >= 400:
+            print(f"WhatsApp API error {r.status_code}: {r.text}")
+        r.raise_for_status()
+
+
 async def send_list_menu(to: str, body_text: str, button_text: str, sections: list[dict], footer: str | None = None) -> None:
     """
     Send a native WhatsApp List Message — renders as a tappable button that opens
