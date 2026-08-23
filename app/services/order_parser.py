@@ -30,7 +30,7 @@ romanized Hindi), "en" for English.
 For new_order or edit_order intents, extract items:
 - Only match items that exist in the given menu. Anything not on the menu goes in "unavailable_items".
 - Quantities: interpret common Indian phrasing — "1 kg", "2 dozen", "adha kilo" (0.5 kg), "ek dozen"
-  (1 dozen), "5 pieces".
+  (1 dozen), "5 pieces", "2 packets", "1 litre", "500 ml", "1 bunch".
 - IMPORTANT: if the customer names a product WITHOUT stating any quantity at all (e.g. just "mango",
   "banana chahiye", "I want apple"), set "quantity" to null. Do NOT assume or default a quantity —
   the shop will ask the customer how much they want. Only fill in a quantity when the customer
@@ -97,23 +97,85 @@ def parse_message(customer_message: str, menu: list[dict]) -> dict:
     return parsed
 
 
-def parse_quantity_only(text: str) -> float | None:
+# Unit detection patterns, checked in this priority order (kg before gram, litre
+# before ml, since "kg"/"litre" text can otherwise get mis-caught by looser
+# patterns). No leading \b — WhatsApp replies like "2kg" or "500gm" have the
+# number glued directly to the unit.
+_UNIT_PATTERNS = [
+    ("kg", re.compile(r"kg\b|\bkilo(s)?\b|किलो")),
+    ("gram", re.compile(r"gram(s)?\b|gm\b|g\b|ग्राम")),
+    ("litre", re.compile(r"litre(s)?\b|liter(s)?\b|\bl\b|लीटर")),
+    ("ml", re.compile(r"\bml\b|मिली")),
+    ("dozen", re.compile(r"dozen|dzn\b|दर्जन")),
+    ("piece", re.compile(r"piece(s)?\b|pcs?\b|पीस|नग")),
+    ("packet", re.compile(r"packet(s)?\b|pkt\b|पैकेट")),
+    ("bunch", re.compile(r"bunch(es)?\b|गुच्छा|गुच्छे")),
+]
+
+
+def _convert(val: float, from_unit: str, to_unit: str) -> float | None:
+    """Converts between units the shop actually sells in. Returns None if the
+    pair isn't a sensible conversion (e.g. someone said 'litre' for a kg product).
+    Units without a natural conversion partner (packet, bunch, piece<->kg, etc.)
+    simply aren't in this table — that's intentional, not an oversight."""
+    if from_unit == to_unit:
+        return val
+    pair = {from_unit, to_unit}
+    if pair == {"kg", "gram"}:
+        return round(val / 1000, 3) if from_unit == "gram" else val * 1000
+    if pair == {"litre", "ml"}:
+        return round(val / 1000, 3) if from_unit == "ml" else val * 1000
+    if pair == {"dozen", "piece"}:
+        return round(val / 12, 3) if from_unit == "piece" else val * 12
+    return None
+
+
+def parse_quantity_only(text: str, target_unit: str = "kg") -> float | None:
     """
     Used when we've already asked 'kitna chahiye?' and are expecting just a
-    quantity reply, e.g. '2kg', '1 dozen', '3', 'adha kilo'. Cheap regex parse —
-    no need to spend a Groq call on a one-word reply.
+    quantity reply — e.g. '2kg', '500 gram', '1 dozen', '6 pieces', '3', 'adha kilo'.
+
+    target_unit is the product's actual unit ('kg', 'dozen', or 'piece'). The
+    returned number is always converted into THAT unit, so a customer can reply
+    in whatever unit is natural to them (grams for a kg item, pieces for a dozen
+    item, etc.) without silently mis-pricing the order.
     """
     t = text.strip().lower()
+
     for pattern, value in _QTY_PATTERNS:
         if pattern.search(t):
+            # "adha kilo" etc. — these are a fraction of whatever the customer
+            # is naming, and are already expressed in the target unit in normal
+            # usage (e.g. "adha dozen" = half a dozen), so no conversion needed.
             return value
+
     match = _NUM_RE.search(t)
-    if match:
-        try:
-            val = float(match.group(1))
-            return val if val > 0 else None
-        except ValueError:
-            return None
+    if not match:
+        return None
+    try:
+        val = float(match.group(1))
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+
+    detected_unit = None
+    for unit_name, pattern in _UNIT_PATTERNS:
+        if pattern.search(t):
+            detected_unit = unit_name
+            break
+
+    if detected_unit is None or detected_unit == target_unit:
+        # No unit stated, or it matches the product's unit — use as-is.
+        return val
+
+    converted = _convert(val, detected_unit, target_unit)
+    if converted is not None:
+        return converted
+
+    # Customer stated a unit that doesn't convert cleanly to this product's unit
+    # (e.g. said "kg" for a piece-sold item like watermelon). Rather than silently
+    # mis-price it, treat as unparseable so webhook.py re-asks instead of guessing.
     return None
 
 

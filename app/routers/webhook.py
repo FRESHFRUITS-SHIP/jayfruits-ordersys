@@ -121,10 +121,50 @@ ACKNOWLEDGEMENT_WORDS = {
     "dhanyavad", "shukriya", "theek hai", "thik hai",
 }
 
+ABOUT_TRIGGERS = {
+    "about", "help", "what is this", "who are you", "what are you",
+    "kaun ho", "yeh kya hai", "ye kya hai", "kya hai yeh", "info",
+    "how does this work", "how to order",
+}
+
 PICKUP_WORDS = {
     "pickup", "pick up", "self pickup", "i'll pick up", "ill pick up",
     "i will pick up", "self pick up", "pick-up",
 }
+
+
+async def _send_about_message(to: str, lang: str) -> None:
+    text = _t(
+        lang,
+        f"ℹ️ *About {SHOP_NAME}*\n\n"
+        f"I'm an automated ordering assistant 🤖🍉 — I take fruit orders here on WhatsApp, "
+        f"round the clock, on behalf of {SHOP_NAME}.\n\n"
+        "*How to order:*\n"
+        "• Type a fruit name (e.g. 'mango') and I'll ask how much\n"
+        "• Or send it all at once: '2kg mango, 1 dozen banana'\n"
+        "• Type 'menu' anytime to browse everything\n"
+        "• Type 'cancel' to cancel an open order, or 'same as last time' to reorder\n\n"
+        f"For anything I can't handle, call the shop directly: {SHOP_WHATSAPP_DISPLAY_NUMBER} 🙏",
+        f"ℹ️ *{SHOP_NAME} के बारे में*\n\n"
+        f"मैं एक ऑटोमेटेड ऑर्डरिंग असिस्टेंट हूं 🤖🍉 — {SHOP_NAME} की तरफ से यहां WhatsApp पर "
+        "24 घंटे ऑर्डर लेता हूं।\n\n"
+        "*ऑर्डर कैसे करें:*\n"
+        "• किसी फल का नाम लिखें (जैसे 'mango') और मैं मात्रा पूछूंगा\n"
+        "• या एक साथ भेजें: '2kg mango, 1 dozen banana'\n"
+        "• पूरा मेन्यू देखने के लिए कभी भी 'menu' लिखें\n"
+        "• खुला ऑर्डर रद्द करने के लिए 'cancel' लिखें\n\n"
+        f"किसी और मदद के लिए सीधे दुकान पर कॉल करें: {SHOP_WHATSAPP_DISPLAY_NUMBER} 🙏",
+        f"ℹ️ *{SHOP_NAME} ke baare mein*\n\n"
+        f"Main ek automated ordering assistant hoon 🤖🍉 — {SHOP_NAME} ki taraf se WhatsApp pe "
+        "24x7 order leta hoon.\n\n"
+        "*Order kaise karein:*\n"
+        "• Kisi fruit ka naam likho (jaise 'mango'), main quantity pooch lunga\n"
+        "• Ya ek saath bhejo: '2kg mango, 1 dozen banana'\n"
+        "• Poora menu dekhne ke liye kabhi bhi 'menu' likho\n"
+        "• Khula order cancel karne ke liye 'cancel' likho\n\n"
+        f"Kisi bhi aur madad ke liye seedha shop ko call karo: {SHOP_WHATSAPP_DISPLAY_NUMBER} 🙏",
+    )
+    await send_text(to, text)
 
 
 async def _send_language_selection(to: str) -> None:
@@ -153,11 +193,14 @@ async def _greeting_and_menu(to: str, lang: str, is_first_time: bool = False) ->
         intro = _t(
             lang,
             f"{greet_en}! 🍉 Welcome to {SHOP_NAME} — fresh fruits, delivered daily. 🍎🍌🍇\n"
-            f"Aaj {names} bahut accha hai. What can I get you today?",
+            f"Aaj {names} bahut accha hai. What can I get you today?\n\n"
+            "_(Type 'help' anytime to see how ordering works.)_",
             f"{greet_hi}! 🍉 {SHOP_NAME} में आपका स्वागत है — रोज़ ताज़े फल। 🍎🍌🍇\n"
-            f"आज {names} बहुत अच्छा है। आज क्या चाहिए?",
+            f"आज {names} बहुत अच्छा है। आज क्या चाहिए?\n\n"
+            "_(ऑर्डर कैसे करें जानने के लिए कभी भी 'help' लिखें।)_",
             f"{greet_hg}! 🍉 Welcome to {SHOP_NAME} — fresh fruits, daily. 🍎🍌🍇\n"
-            f"Aaj {names} bahut accha hai. Aapko kya chahiye?",
+            f"Aaj {names} bahut accha hai. Aapko kya chahiye?\n\n"
+            "_(Kabhi bhi 'help' likho order karne ka tarika jaanne ke liye.)_",
         )
     else:
         intro = _t(
@@ -220,6 +263,11 @@ async def handle_text_message(from_number: str, text: str) -> None:
         await _greeting_and_menu(from_number, lang)
         return
 
+    if stripped in ABOUT_TRIGGERS:
+        lang = customer.get("preferred_language") or "en"
+        await _send_about_message(from_number, lang)
+        return
+
     if stripped in ACKNOWLEDGEMENT_WORDS:
         lang = customer.get("preferred_language") or "en"
         await send_text(from_number, _t(lang, "You're welcome! 😊", "आपका स्वागत है! 😊"))
@@ -248,7 +296,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
     pending = customer.get("pending_item")
     if pending:
         lang = customer.get("preferred_language") or "en"
-        qty = parse_quantity_only(text)
+        qty = parse_quantity_only(text, target_unit=pending["unit"])
         if qty:
             svc.clear_pending_item(customer["id"])
             menu = svc.get_available_menu()
