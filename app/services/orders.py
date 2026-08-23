@@ -69,6 +69,53 @@ def get_product_by_id(product_id: int) -> dict | None:
     return res.data[0] if res.data else None
 
 
+def find_variant_options(query: str, menu: list[dict]) -> list[dict]:
+    """
+    Looks up a customer's item name against the menu and returns ALL matching
+    variants (e.g. "apple" -> Shimla Apple, Kashmiri Apple, Fuji Apple...).
+
+    - If the query matches a product's exact name, that single product wins
+      (customer already named a specific variant — no need to ask again).
+    - Otherwise, matches by variant_group (falls back to name_en for products
+      that were never given a distinct group), so a generic fruit name surfaces
+      every variant that belongs to it.
+    """
+    q = query.lower().strip()
+
+    exact = [
+        p for p in menu
+        if p["name_en"].lower() == q or (p.get("name_hi") and p["name_hi"].lower() == q)
+    ]
+    if exact:
+        return exact
+
+    group_matches = [
+        p for p in menu
+        if (p.get("variant_group") or p["name_en"]).lower() == q
+    ]
+    if group_matches:
+        return group_matches
+
+    # loose partial match as a last resort (e.g. "seb" matching "सेब")
+    return [
+        p for p in menu
+        if q in p["name_en"].lower() or q in (p.get("variant_group") or "").lower()
+    ]
+
+
+def build_variant_list_section(products: list[dict], title: str = "Choose one") -> list[dict]:
+    """Builds a single-section List Message payload so a customer can pick a specific variant."""
+    rows = [
+        {
+            "id": f"prod_{p['id']}",
+            "title": p["name_en"][:24],
+            "description": f"₹{p['price']}/{p['unit']}"[:72],
+        }
+        for p in products[:10]
+    ]
+    return [{"title": title[:24], "rows": rows}]
+
+
 # ---------- shop settings ----------
 
 def get_shop_settings() -> dict:

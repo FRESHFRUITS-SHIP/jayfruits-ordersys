@@ -2,11 +2,19 @@ import hashlib
 import hmac
 from fastapi import APIRouter, Request, Query, HTTPException, Response
 
+from datetime import datetime
 from app.config import (
     META_VERIFY_TOKEN, META_APP_SECRET, SHOP_NAME,
     SHOP_WHATSAPP_DISPLAY_NUMBER, PUBLIC_BASE_URL,
 )
-from app.services.whatsapp import send_text, send_buttons, send_list_menu
+# Add SHOP_BANNER_IMAGE_URL to app/config.py — a public https:// image URL
+# (e.g. your shop's storefront/logo). If you don't want a banner image yet,
+# leave it unset; the code below just skips it.
+try:
+    from app.config import SHOP_BANNER_IMAGE_URL
+except ImportError:
+    SHOP_BANNER_IMAGE_URL = None
+from app.services.whatsapp import send_text, send_buttons, send_list_menu, send_image
 from app.services.order_parser import parse_message, parse_quantity_only
 from app.services.upi import build_upi_link
 from app.services import orders as svc
@@ -66,7 +74,10 @@ async def receive_message(request: Request):
                 "I can only read text messages right now — could you please type your order? 🙏\n"
                 "उदाहरण: '2kg mango, 1 dozen banana'",
             )
+        elif msg["type"] in ("sticker", "reaction"):
+            pass  # not worth replying to — avoids a confusing "send as text" message for a 👍 or sticker
         else:
+            print(f"Unhandled WhatsApp message type: {msg['type']} — payload: {msg}")
             await send_text(from_number, "Please send your order as text, e.g. '2kg mango, 1 dozen banana'.")
 
     except (KeyError, IndexError):
@@ -76,8 +87,27 @@ async def receive_message(request: Request):
 
 
 # ---------- helpers ----------
-def _t(lang: str, en: str, hi: str) -> str:
-    return hi if lang == "hi" else en
+def _t(lang: str, en: str, hi: str, hg: str | None = None) -> str:
+    """
+    lang: 'en' (English), 'hi' (Hindi/Devanagari), or 'hg' (Hinglish — romanized mix).
+    If a string hasn't been given a dedicated Hinglish version yet, falls back to English
+    (reads fine for a Hinglish speaker, rather than leaving a blank).
+    """
+    if lang == "hi":
+        return hi
+    if lang == "hg":
+        return hg if hg is not None else en
+    return en
+
+
+def _time_based_greeting_emoji() -> tuple[str, str, str]:
+    """Returns (en_word, hi_word, hg_word) for the current time of day, IST-ish based on server time."""
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Good morning", "सुप्रभात", "Good morning"
+    if hour < 17:
+        return "Good afternoon", "नमस्ते", "Good afternoon"
+    return "Good evening", "शुभ संध्या", "Good evening"
 
 
 def _fmt_qty(qty: float) -> str:
@@ -97,33 +127,65 @@ PICKUP_WORDS = {
 }
 
 
-async def _greeting_and_menu(to: str, lang: str) -> None:
+async def _send_language_selection(to: str) -> None:
+    await send_buttons(
+        to,
+        "🍉 Welcome! Please choose your language / भाषा चुनें:",
+        [("lang_en", "English"), ("lang_hi", "हिंदी"), ("lang_hg", "Hinglish")],
+    )
+
+
+async def _greeting_and_menu(to: str, lang: str, is_first_time: bool = False) -> None:
     # Any pending "kitna chahiye?" flow is stale once someone re-greets — clear it
     # so we don't end up mis-parsing "hi" as a quantity reply later.
     customer = svc.get_or_create_customer(to)
     if customer.get("pending_item"):
         svc.clear_pending_item(customer["id"])
 
+    if SHOP_BANNER_IMAGE_URL:
+        await send_image(to, SHOP_BANNER_IMAGE_URL, caption=f"🍇🍊🍎 {SHOP_NAME}")
+
     top_items = svc.get_top_selling_or_seasonal(limit=4)
     names = ", ".join(p["name_en"] for p in top_items)
+    greet_en, greet_hi, greet_hg = _time_based_greeting_emoji()
 
-    intro = _t(
-        lang,
-        f"🍉 Namaste! Welcome to {SHOP_NAME} — fresh fruits, daily. "
-        f"Aaj {names} bahut accha hai. What can I get you today?",
-        f"🍉 नमस्ते! {SHOP_NAME} में आपका स्वागत है — रोज़ ताज़े फल। "
-        f"आज {names} बहुत अच्छा है। आज क्या चाहिए?",
-    )
+    if is_first_time:
+        intro = _t(
+            lang,
+            f"{greet_en}! 🍉 Welcome to {SHOP_NAME} — fresh fruits, delivered daily. 🍎🍌🍇\n"
+            f"Aaj {names} bahut accha hai. What can I get you today?",
+            f"{greet_hi}! 🍉 {SHOP_NAME} में आपका स्वागत है — रोज़ ताज़े फल। 🍎🍌🍇\n"
+            f"आज {names} बहुत अच्छा है। आज क्या चाहिए?",
+            f"{greet_hg}! 🍉 Welcome to {SHOP_NAME} — fresh fruits, daily. 🍎🍌🍇\n"
+            f"Aaj {names} bahut accha hai. Aapko kya chahiye?",
+        )
+    else:
+        intro = _t(
+            lang,
+            f"{greet_en}! 🍉 Good to see you again. Aaj {names} bahut accha hai — what would you like?",
+            f"{greet_hi}! 🍉 आपको फिर से देखकर अच्छा लगा। आज {names} बहुत अच्छा है — क्या चाहिए?",
+            f"{greet_hg}! 🍉 Wapas aane ke liye shukriya. Aaj {names} bahut accha hai — kya loge?",
+        )
     await send_text(to, intro)
 
     sections = svc.build_menu_sections()
     if sections:
         await send_list_menu(
             to,
-            body_text=_t(lang, "Tap below for today's full menu 👇", "आज का पूरा मेन्यू देखने के लिए नीचे टैप करें 👇"),
-            button_text=_t(lang, "View Menu", "मेन्यू देखें"),
+            body_text=_t(
+                lang,
+                "Tap below for today's full menu 👇",
+                "आज का पूरा मेन्यू देखने के लिए नीचे टैप करें 👇",
+                "Neeche tap karke aaj ka pura menu dekho 👇",
+            ),
+            button_text=_t(lang, "View Menu", "मेन्यू देखें", "Menu Dekho"),
             sections=sections,
-            footer=_t(lang, "Or just type what you'd like", "या सीधे लिख कर बताएं"),
+            footer=_t(
+                lang,
+                "Or just type what you'd like",
+                "या सीधे लिख कर बताएं",
+                "Ya seedha type karke bata do",
+            ),
         )
 
 
@@ -145,6 +207,13 @@ async def _send_payment_buttons(to: str, lang: str) -> None:
 async def handle_text_message(from_number: str, text: str) -> None:
     customer = svc.get_or_create_customer(from_number)
     stripped = text.strip().lower().strip(".!😊🙏👍")
+
+    # Brand new customer, language never chosen — ask before doing anything else.
+    # (Their first message's content is intentionally set aside; once they pick
+    # a language we go straight into the greeting + menu.)
+    if customer.get("preferred_language") is None:
+        await _send_language_selection(from_number)
+        return
 
     if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
         lang = customer.get("preferred_language") or "en"
@@ -203,12 +272,11 @@ async def handle_text_message(from_number: str, text: str) -> None:
 
     menu = svc.get_available_menu()
     parsed = parse_message(text, menu)
-    lang = parsed.get("language", "en")
-
-    # remember their language for future messages (menu, notifications, etc.)
-    if customer.get("preferred_language") != lang:
-        svc.set_customer_language(customer["id"], lang)
-        customer["preferred_language"] = lang
+    # Language is now chosen explicitly via the onboarding buttons (en/hi/hg) and
+    # stays put — we don't let Groq's per-message language guess overwrite it
+    # (that used to silently flip a customer's "Hinglish" choice back to plain
+    # English/Hindi the moment their wording leaned one way).
+    lang = customer.get("preferred_language") or parsed.get("language", "en")
 
     intent = parsed["intent"]
 
@@ -287,17 +355,40 @@ async def _handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str
     menu = svc.get_available_menu()
     matched = svc.match_products([i["product_name"] for i in parsed["items"]], menu)
 
-    # ---- single item, no quantity given -> ask "kitna chahiye?" and pause ----
+    # ---- single item named, no quantity given: check for variants first ----
     items_missing_qty = [i for i in parsed["items"] if i.get("quantity") in (None, "", 0)]
     if items_missing_qty and len(parsed["items"]) == 1:
         item = items_missing_qty[0]
-        product = matched.get(item["product_name"])
+        variants = svc.find_variant_options(item["product_name"], menu)
+
+        if len(variants) > 1:
+            # Multiple variants (e.g. 10 kinds of apple) — show each with a photo
+            # so the customer can pick, instead of silently guessing one.
+            for v in variants[:8]:  # cap to avoid spamming the chat on huge variant lists
+                if v.get("image_url"):
+                    await send_image(to, v["image_url"], caption=f"{v['name_en']} — ₹{v['price']}/{v['unit']}")
+            sections = svc.build_variant_list_section(variants, title=item["product_name"].title())
+            await send_list_menu(
+                to,
+                body_text=_t(
+                    lang,
+                    f"We've got a few kinds of {item['product_name']} — which one would you like?",
+                    f"{item['product_name']} में कई तरह हैं — कौन सा चाहिए?",
+                    f"{item['product_name']} ke kai variants hain — kaunsa loge?",
+                ),
+                button_text=_t(lang, "Choose Variant", "चुनें", "Choose Karo"),
+                sections=sections,
+            )
+            return
+
+        product = matched.get(item["product_name"]) or (variants[0] if variants else None)
         if product:
             svc.set_pending_item(customer["id"], product)
             await send_text(to, _t(
                 lang,
                 f"{product['name_en']} — kitna chahiye? (e.g. 2 {product['unit']})",
                 f"{product['name_en']} — कितना चाहिए? (जैसे 2 {product['unit']})",
+                f"{product['name_en']} — kitna chahiye? (jaise 2 {product['unit']})",
             ))
             return
 
@@ -512,6 +603,14 @@ async def _handle_address(to: str, customer: dict, parsed: dict, lang: str) -> N
 async def handle_button_reply(from_number: str, button_id: str) -> None:
     customer = svc.get_or_create_customer(from_number)
     lang = customer.get("preferred_language") or "en"
+
+    # ---- tapped a language choice ----
+    if button_id.startswith("lang_"):
+        chosen = button_id.split("_", 1)[1]  # 'en' | 'hi' | 'hg'
+        svc.set_customer_language(customer["id"], chosen)
+        customer["preferred_language"] = chosen
+        await _greeting_and_menu(from_number, chosen, is_first_time=True)
+        return
 
     # ---- tapped a product row from the List Message ----
     if button_id.startswith("prod_"):
