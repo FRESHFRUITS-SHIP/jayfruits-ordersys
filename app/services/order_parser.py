@@ -13,30 +13,39 @@ client = Groq(api_key=GROQ_API_KEY)
 SYSTEM_PROMPT = """You are the message-understanding brain for an Indian fruit shop's WhatsApp line.
 You will be given the shop's current menu and a customer's free-text message (English, Hindi, or Hinglish).
 
+Customers write casually — expect typos, spelling variants ("mango"/"mangoe"/"mangoo"/"aam"), missing
+punctuation, emojis, mixed Devanagari + Roman script in the same message, and filler words ("bhaiya",
+"please", "thoda", "jaldi"). Do your best to understand intent despite this; don't require exact spelling.
+
 First, classify the message's INTENT into exactly one of:
 - "new_order": customer is placing a fresh order (e.g. "2kg mango, 1 dozen banana")
 - "edit_order": customer wants to add/remove something from their existing open order
-  (e.g. "add 1kg banana", "remove mango", "make it 3kg instead")
+  (e.g. "add 1kg banana", "remove mango", "make it 3kg instead", "mango mat bhejna" [don't send mango])
 - "cancel_order": customer wants to cancel their order (e.g. "cancel my order", "cancel please")
 - "reorder": customer wants to repeat a previous order (e.g. "same as last time", "repeat my last order")
 - "address": customer is providing or changing their delivery address
   (e.g. "deliver to Shop 12, Kandivali", "change my address to ...")
 - "greeting": hi/hello/menu/namaste type message with no order content
-- "other": anything else (questions, chit-chat, unclear)
+- "other": anything else (questions, chit-chat, price haggling, complaints, unclear messages)
 
 Also detect the LANGUAGE the customer is writing in: "hi" for Hindi/Hinglish (Devanagari or
 romanized Hindi), "en" for English.
 
 For new_order or edit_order intents, extract items:
-- Only match items that exist in the given menu. Anything not on the menu goes in "unavailable_items".
+- Only match items that exist in the given menu, using fuzzy/typo-tolerant matching against the
+  product names given. Anything you genuinely can't match goes in "unavailable_items" — but try hard
+  before giving up on a near-miss spelling.
 - Quantities: interpret common Indian phrasing — "1 kg", "2 dozen", "adha kilo" (0.5 kg), "ek dozen"
   (1 dozen), "5 pieces", "2 packets", "1 litre", "500 ml", "1 bunch".
 - IMPORTANT: if the customer names a product WITHOUT stating any quantity at all (e.g. just "mango",
   "banana chahiye", "I want apple"), set "quantity" to null. Do NOT assume or default a quantity —
   the shop will ask the customer how much they want. Only fill in a quantity when the customer
   actually stated one (a number, "half", "dozen", "some pieces", etc.).
-- For edit_order, each item needs an "action": "add" or "remove".
+- For edit_order, each item needs an "action": "add" or "remove". Phrases like "mat bhejo", "hata do",
+  "cancel this item", "no need X" mean "remove"; anything additive means "add".
 - Never invent a price — prices come from the menu, not from you.
+- If the customer haggles on price ("kam karo", "discount do", "sasta karo"), do NOT change any price —
+  set intent to "other" and put a short note like "customer is asking for a discount" in "note".
 
 For "address" intent, extract the address text itself into "address_text".
 
@@ -49,9 +58,55 @@ Respond with ONLY valid JSON, no markdown, no explanation, in this exact shape:
   ],
   "unavailable_items": ["strawberry"],
   "address_text": "",
-  "note": "short plain-English note if message had a question mixed in, else empty string"
+  "note": "short plain-English note if message had a question, complaint, or haggling mixed in, else empty string"
 }
 """
+
+SHOPKEEPER_SYSTEM_PROMPT = """You are Ravi, who runs {shop_name}, personally texting a customer back
+on WhatsApp. Write the way a real, friendly Indian fruit-shop owner actually texts — warm, brief
+(1-2 short sentences, occasionally 3), natural mixing of Hindi/English/Hinglish that matches the
+customer's own language, a light emoji here and there but not overused.
+
+Hard rules:
+- Never sound like a bot, a customer-support script, or a company. No bullet points, no headers,
+  no "Dear customer", no signing off with your name.
+- Never state or imply a specific price, discount, total, or promise about delivery time — those come
+  from the app separately and must stay exact. If the situation involves a discount request, gently
+  decline without inventing a number ("bhai thoda tight hai rate pe, already best price hai" style is fine,
+  but don't say a percentage or number unless it was explicitly given to you in the context).
+- Keep it to plain text only — the app will send any buttons/menus/prices separately.
+- Reply in the SAME language style given to you (en / hi / hg).
+"""
+
+
+def generate_shopkeeper_reply(situation: str, lang: str, shop_name: str) -> str | None:
+    """
+    Used for the conversational, non-transactional parts of the chat (small talk,
+    unclear messages, haggling, "how are you" type chit-chat) — NOT for anything
+    that states a price, total, or order confirmation. Those stay as deterministic
+    templates in webhook.py so a model can never mis-state money.
+
+    Returns None on any failure so callers can fall back to a static message —
+    this must never be the only path to a reply.
+    """
+    lang_label = {"en": "English", "hi": "Hindi (Devanagari)", "hg": "Hinglish (romanized mix)"}.get(lang, "English")
+    try:
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SHOPKEEPER_SYSTEM_PROMPT.format(shop_name=shop_name)},
+                {"role": "user", "content": f"Reply in: {lang_label}\nSituation: {situation}\n\nWrite ONE short WhatsApp reply. No quotes around it, no markdown."},
+            ],
+            temperature=0.7,
+            max_tokens=100,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        # basic safety net — strip stray quote wrapping the model sometimes adds
+        text = text.strip('"').strip()
+        return text or None
+    except Exception as e:
+        print(f"Groq shopkeeper reply failed: {e}")
+        return None
 
 # Simple regex fallback for parsing a bare quantity reply like "2kg", "1 dozen", "3", "adha kilo"
 _QTY_PATTERNS = [
@@ -112,6 +167,38 @@ _UNIT_PATTERNS = [
     ("bunch", re.compile(r"bunch(es)?\b|गुच्छा|गुच्छे")),
 ]
 
+# Fallback classifier for typo'd/partial unit words (e.g. "gra" instead of
+# "gram", "kge" instead of "kg"). This is intentionally the SAFE path: if a
+# word is attached to the number and we genuinely can't classify it, we must
+# NOT guess — we return None so the caller re-asks instead of silently
+# mis-pricing an order (this is exactly the bug that let "658 gra," through
+# as 658 kg instead of 0.658 kg).
+_UNIT_WORD_RE = re.compile(r"[a-zA-Zऀ-ॿ]+")
+
+_PREFIX_UNIT_MAP = [
+    (("kg", "kilo", "किलो"), "kg"),
+    (("g", "gm", "gr", "gra", "gram", "grams", "ग्राम"), "gram"),
+    (("l", "li", "lit", "litre", "liter", "लीटर"), "litre"),
+    (("ml", "मिली"), "ml"),
+    (("doz", "dzn", "दर्जन"), "dozen"),
+    (("pc", "pcs", "piece", "pieces", "पीस", "नग"), "piece"),
+    (("pkt", "pk", "packet", "packets", "पैकेट"), "packet"),
+    (("bun", "bunch", "bunches", "गुच्छा", "गुच्छे"), "bunch"),
+]
+
+
+def _classify_unit_word(word: str) -> str | None:
+    """Best-effort match of a (possibly typo'd) unit word to a known unit.
+    Returns None — deliberately — if it can't confidently classify it."""
+    w = word.lower()
+    if not w:
+        return None
+    for prefixes, unit in _PREFIX_UNIT_MAP:
+        for p in prefixes:
+            if w == p or w.startswith(p):
+                return unit
+    return None
+
 
 def _convert(val: float, from_unit: str, to_unit: str) -> float | None:
     """Converts between units the shop actually sells in. Returns None if the
@@ -133,49 +220,63 @@ def _convert(val: float, from_unit: str, to_unit: str) -> float | None:
 def parse_quantity_only(text: str, target_unit: str = "kg") -> float | None:
     """
     Used when we've already asked 'kitna chahiye?' and are expecting just a
-    quantity reply — e.g. '2kg', '500 gram', '1 dozen', '6 pieces', '3', 'adha kilo'.
+    quantity reply — e.g. '2kg', '500 gram', '1 dozen', '6 pieces', '3',
+    'adha kilo', or a typo like '658 gra,'.
 
-    target_unit is the product's actual unit ('kg', 'dozen', or 'piece'). The
-    returned number is always converted into THAT unit, so a customer can reply
-    in whatever unit is natural to them (grams for a kg item, pieces for a dozen
-    item, etc.) without silently mis-pricing the order.
+    Safety rule: a BARE number (no unit word at all, e.g. "3") is assumed to be
+    in the product's own unit. But if the customer DID attach a word and we
+    can't confidently classify it, we return None so the caller re-asks —
+    we never silently guess a unit, because guessing wrong on a kg-priced
+    item can turn a ₹150 order into a ₹150,000 order.
     """
     t = text.strip().lower()
 
     for pattern, value in _QTY_PATTERNS:
         if pattern.search(t):
-            # "adha kilo" etc. — these are a fraction of whatever the customer
-            # is naming, and are already expressed in the target unit in normal
-            # usage (e.g. "adha dozen" = half a dozen), so no conversion needed.
             return value
 
-    match = _NUM_RE.search(t)
-    if not match:
+    num_match = _NUM_RE.search(t)
+    if not num_match:
         return None
     try:
-        val = float(match.group(1))
+        val = float(num_match.group(1))
     except ValueError:
         return None
     if val <= 0:
         return None
 
+    # Look for a unit word anywhere in the reply (handles "658 gra," / "2kg" /
+    # "500 gram" alike), trying the exact patterns first, then the typo-tolerant
+    # prefix classifier as a fallback.
     detected_unit = None
     for unit_name, pattern in _UNIT_PATTERNS:
         if pattern.search(t):
             detected_unit = unit_name
             break
 
-    if detected_unit is None or detected_unit == target_unit:
-        # No unit stated, or it matches the product's unit — use as-is.
+    if detected_unit is None:
+        word_match = _UNIT_WORD_RE.search(t[num_match.end():])
+        if word_match:
+            detected_unit = _classify_unit_word(word_match.group(0))
+            if detected_unit is None:
+                # There WAS a word attached but we couldn't classify it —
+                # don't guess, force a re-ask.
+                return None
+
+    if detected_unit is None:
+        # Genuinely bare number, no trailing word at all — assume target unit.
+        return val
+
+    if detected_unit == target_unit:
         return val
 
     converted = _convert(val, detected_unit, target_unit)
     if converted is not None:
         return converted
 
-    # Customer stated a unit that doesn't convert cleanly to this product's unit
-    # (e.g. said "kg" for a piece-sold item like watermelon). Rather than silently
-    # mis-price it, treat as unparseable so webhook.py re-asks instead of guessing.
+    # Stated a unit that doesn't convert cleanly to this product's unit
+    # (e.g. said "kg" for a piece-sold item like watermelon) — re-ask instead
+    # of mis-pricing.
     return None
 
 

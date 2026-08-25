@@ -173,6 +173,19 @@ def set_customer_language(customer_id: int, lang: str) -> None:
     update_customer(customer_id, {"preferred_language": lang})
 
 
+def set_customer_name(customer_id: int, name: str) -> None:
+    update_customer(customer_id, {"name": name})
+
+
+def set_pending_order(customer_id: int, data: dict) -> None:
+    """Holds a parsed-but-not-yet-created order until the customer taps Confirm."""
+    update_customer(customer_id, {"pending_order": data})
+
+
+def clear_pending_order(customer_id: int) -> None:
+    update_customer(customer_id, {"pending_order": None})
+
+
 def set_pending_item(customer_id: int, product: dict) -> None:
     """Stash the product a customer named without a quantity, so the next message
     (assumed to be just a quantity, e.g. '2kg') can complete the order."""
