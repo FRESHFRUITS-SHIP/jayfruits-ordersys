@@ -17,20 +17,6 @@ app.include_router(customer_page.router)
 async def root():
     return RedirectResponse(url="/orders")
 
-@app.get("/debug/secret-check")
-async def debug_secret_check():
-    """TEMPORARY — remove after debugging."""
-    from app.config import META_APP_SECRET, META_ACCESS_TOKEN, META_PHONE_NUMBER_ID
-    return {
-        "app_secret_is_empty": META_APP_SECRET == "",
-        "app_secret_length": len(META_APP_SECRET),
-        "access_token_length": len(META_ACCESS_TOKEN),
-        "access_token_first10": META_ACCESS_TOKEN[:10] if META_ACCESS_TOKEN else "",
-        "access_token_last6": META_ACCESS_TOKEN[-6:] if len(META_ACCESS_TOKEN) > 6 else "",
-        "phone_number_id": META_PHONE_NUMBER_ID,
-    }
-
-
 @app.post("/tasks/daily-summary")
 async def trigger_daily_summary():
     """
