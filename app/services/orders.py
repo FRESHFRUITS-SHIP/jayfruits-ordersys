@@ -133,9 +133,12 @@ def update_shop_settings(fields: dict) -> None:
         db.table("shop_settings").update(fields).eq("id", settings["id"]).execute()
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def is_within_business_hours(now: datetime | None = None) -> bool:
     settings = get_shop_settings()
-    now = now or datetime.now()
+    now = now or datetime.now(IST)
     hour = now.hour
     start = settings.get("business_hours_start", 7)
     end = settings.get("business_hours_end", 22)

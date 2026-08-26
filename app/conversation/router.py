@@ -26,11 +26,12 @@ async def handle_text_message(from_number: str, text: str) -> None:
         await send_language_selection(from_number)
         return
 
-    # Language chosen but name not yet captured — this message IS their name.
+        # Language chosen but name not yet captured — this message IS their name.
     if not customer.get("name") and not customer.get("pending_item") and not customer.get("pending_order"):
         lang0 = customer.get("preferred_language") or "en"
         name_text = text.strip()
-        if not (1 <= len(name_text) <= 40):
+        NON_NAME_WORDS = {"hi", "hello", "hey", "hii", "hlo", "menu", "namaste"} | ACKNOWLEDGEMENT_WORDS | ABOUT_TRIGGERS | PICKUP_WORDS
+        if not (1 <= len(name_text) <= 40) or stripped in NON_NAME_WORDS:
             await send_text(from_number, _t(
                 lang0,
                 "Please share just your first name 🙂",
@@ -43,7 +44,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
         customer["name"] = clean_name
         await greeting_and_menu(from_number, lang0, is_first_time=True)
         return
-
+    
     if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
         lang = customer.get("preferred_language") or "en"
         await greeting_and_menu(from_number, lang)

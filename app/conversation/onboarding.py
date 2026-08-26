@@ -1,5 +1,7 @@
 """Language selection + greeting/menu. Pulled out of webhook.py, pure move."""
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 try:
     from app.config import SHOP_BANNER_IMAGE_URL
@@ -12,7 +14,7 @@ from app.conversation.messages import _t, _name_bit
 
 
 def _time_based_greeting_emoji() -> tuple[str, str, str]:
-    hour = datetime.now().hour
+    hour = datetime.now(IST).hour
     if hour < 12:
         return "Good morning", "सुप्रभात", "Good morning"
     if hour < 17:
