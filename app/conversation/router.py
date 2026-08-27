@@ -9,6 +9,7 @@ from app.services.whatsapp import send_text
 from app.services.order_parser import parse_message, parse_quantity_only, generate_shopkeeper_reply
 from app.services.upi import build_upi_link
 from app.services import orders as svc
+from app.services.audit import log_event
 
 from app.conversation.messages import _t, _fmt_qty, _name_bit, ACKNOWLEDGEMENT_WORDS, ABOUT_TRIGGERS, PICKUP_WORDS, send_about_message
 from app.conversation.onboarding import send_language_selection, greeting_and_menu
@@ -26,7 +27,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
         await send_language_selection(from_number)
         return
 
-        # Language chosen but name not yet captured — this message IS their name.
+    # Language chosen but name not yet captured — this message IS their name.
     if not customer.get("name") and not customer.get("pending_item") and not customer.get("pending_order"):
         lang0 = customer.get("preferred_language") or "en"
         name_text = text.strip()
@@ -44,7 +45,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
         customer["name"] = clean_name
         await greeting_and_menu(from_number, lang0, is_first_time=True)
         return
-    
+
     if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
         lang = customer.get("preferred_language") or "en"
         await greeting_and_menu(from_number, lang)
@@ -301,6 +302,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
 
     if button_id == "pay_upi":
         svc.set_order_payment_mode(order["id"], "upi")
+        log_event("PAYMENT_STARTED", customer_id=customer["id"], details={"order_id": order["id"], "mode": "upi", "amount": order["total"]})
         link = build_upi_link(order["total"], order["id"])
         who = _name_bit(customer)
         await send_text(from_number, _t(
@@ -311,6 +313,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
         ))
     elif button_id == "pay_cod":
         svc.set_order_payment_mode(order["id"], "cod")
+        log_event("PAYMENT_STARTED", customer_id=customer["id"], details={"order_id": order["id"], "mode": "cod", "amount": order["total"]})
         who = _name_bit(customer)
         await send_text(from_number, _t(
             lang,

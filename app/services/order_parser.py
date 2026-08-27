@@ -5,6 +5,7 @@ prices — it can only pick from what's really on the menu).
 """
 import json
 import re
+import time
 from groq import Groq
 from app.config import GROQ_API_KEY, GROQ_MODEL
 
@@ -126,30 +127,45 @@ def parse_message(customer_message: str, menu: list[dict]) -> dict:
 
     user_prompt = f"MENU:\n{menu_text}\n\nCUSTOMER MESSAGE:\n{customer_message}"
 
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
+    # Phase 1: Groq is a single point of failure with no retry/fallback before this.
+    # Retry transient errors (timeout, 5xx) with short backoff; a 4xx (bad request,
+    # auth) won't succeed on retry, so fail straight to the deterministic fallback.
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return _fallback()
 
-    raw = resp.choices[0].message.content
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return _fallback()
+            parsed.setdefault("intent", "other")
+            parsed.setdefault("language", "en")
+            parsed.setdefault("items", [])
+            parsed.setdefault("unavailable_items", [])
+            parsed.setdefault("address_text", "")
+            parsed.setdefault("note", "")
+            return parsed
+        except Exception as e:
+            last_err = e
+            status = getattr(e, "status_code", None)
+            if status is not None and 400 <= status < 500 and status != 429:
+                # Bad request / auth error — retrying won't help.
+                break
+            if attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))  # 0.5s, then 1s
 
-    # defensive defaults in case the model omits a field
-    parsed.setdefault("intent", "other")
-    parsed.setdefault("language", "en")
-    parsed.setdefault("items", [])
-    parsed.setdefault("unavailable_items", [])
-    parsed.setdefault("address_text", "")
-    parsed.setdefault("note", "")
-    return parsed
+    print(f"Groq parse_message failed after retries: {last_err}")
+    return _fallback()
 
 
 # Unit detection patterns, checked in this priority order (kg before gram, litre

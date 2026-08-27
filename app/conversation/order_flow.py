@@ -2,6 +2,7 @@
 Pulled out of webhook.py, pure move — no behavior change."""
 from app.services.whatsapp import send_text, send_buttons, send_image, send_list_menu
 from app.services import orders as svc
+from app.services.audit import log_event
 from app.conversation.messages import _t, _fmt_qty, _name_bit
 from app.conversation.fulfillment import ask_fulfillment_or_address
 
@@ -16,6 +17,10 @@ async def finalize_order(
         customer["id"], items_for_order, raw_message=raw_text,
         source="whatsapp", delivery_address=customer.get("address") or "",
     )
+    log_event("ORDER_CONFIRMED", customer_id=customer["id"], details={
+        "order_id": order["id"], "total": order["total"],
+        "items": [{"name": i["product"]["name_en"], "qty": i["quantity"]} for i in items_for_order],
+    })
     who = _name_bit(customer)
     summary = "\n".join(lines)
     header = _t(
@@ -190,9 +195,11 @@ async def handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None:
         action = item.get("action", "add")
         if action == "remove":
             new_total = svc.remove_item_from_order(order["id"], product["name_en"])
+            log_event("ITEM_REMOVED", customer_id=customer["id"], details={"order_id": order["id"], "product": product["name_en"]})
             changes.append(_t(lang, f"Removed {product['name_en']}", f"{product['name_en']} हटाया गया", f"{product['name_en']} hataya gaya"))
         else:
             new_total = svc.add_item_to_order(order["id"], product, qty)
+            log_event("ITEM_ADDED", customer_id=customer["id"], details={"order_id": order["id"], "product": product["name_en"], "qty": qty})
             changes.append(_t(
                 lang,
                 f"Added {_fmt_qty(qty)} {product['unit']} {product['name_en']}",
@@ -215,6 +222,7 @@ async def handle_cancel(to: str, customer: dict, lang: str) -> None:
         await send_text(to, _t(lang, "You don't have an active order to cancel.", "आपका कोई सक्रिय ऑर्डर नहीं है।", "Aapka koi active order nahi hai."))
         return
     svc.cancel_order(order["id"])
+    log_event("ORDER_CANCELLED", customer_id=customer["id"], details={"order_id": order["id"]})
     await send_text(to, _t(
         lang, f"Order #{order['id']} has been cancelled. No charge.",
         f"ऑर्डर #{order['id']} रद्द कर दिया गया है। कोई शुल्क नहीं।",
