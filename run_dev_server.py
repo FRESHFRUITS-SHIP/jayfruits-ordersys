@@ -251,6 +251,7 @@ pollLoop();
 app.include_router(fake_chat_router)
 
 if __name__ == "__main__":
-    print("Dashboard:      http://127.0.0.1:8000/orders")
-    print("Fake WhatsApp:  http://127.0.0.1:8000/chat")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Dashboard:      http://0.0.0.0:{port}/orders")
+    print(f"Fake WhatsApp:  http://0.0.0.0:{port}/chat")
+    uvicorn.run(app, host="0.0.0.0", port=port)
