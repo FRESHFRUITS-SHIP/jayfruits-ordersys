@@ -1,8 +1,13 @@
 """
 Top-level conversation dispatcher. This is what app/routers/webhook.py calls
-after unwrapping the Meta payload. Pulled out of webhook.py — pure move,
-no behavior change. (Note: this is still the *implicit* state model — pending_item/
-pending_order flags — not the explicit state machine Phase 2 will introduce.)
+after unwrapping the Meta payload.
+
+Phase 2: every branch below now also updates the explicit conversation_state
+(see app/conversation/state.py) alongside the pending_item/pending_order
+flags. The flags remain the actual data (what item, what draft order); the
+state is the explicit label of "where in the flow is this customer" — used
+for validation, debugging, and interruption handling (a customer asking an
+unrelated question mid-flow now correctly resumes afterward).
 """
 from app.config import SHOP_WHATSAPP_DISPLAY_NUMBER, SHOP_NAME
 from app.services.whatsapp import send_text
@@ -15,16 +20,22 @@ from app.conversation.messages import _t, _fmt_qty, _name_bit, ACKNOWLEDGEMENT_W
 from app.conversation.onboarding import send_language_selection, greeting_and_menu
 from app.conversation.fulfillment import send_payment_buttons, ask_fulfillment_or_address, apply_pickup, handle_address
 from app.conversation.order_flow import handle_new_order, handle_edit, handle_cancel, handle_reorder, finalize_order
+from app.conversation.state import (
+    ConversationState, get_state, set_state,
+    push_interruption, pop_interruption, clear_interruption,
+)
 
 
 # ---------- main conversation handler ----------
 async def handle_text_message(from_number: str, text: str) -> None:
     customer = svc.get_or_create_customer(from_number)
+    current_state = get_state(customer)
     stripped = text.strip().lower().strip(".!😊🙏👍")
 
     # Brand new customer — ask language before doing anything else.
     if customer.get("preferred_language") is None:
         await send_language_selection(from_number)
+        set_state(customer["id"], ConversationState.LANGUAGE_SELECTION, current=current_state)
         return
 
     # Language chosen but name not yet captured — this message IS their name.
@@ -44,6 +55,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
         svc.set_customer_name(customer["id"], clean_name)
         customer["name"] = clean_name
         await greeting_and_menu(from_number, lang0, is_first_time=True)
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
         return
 
     if stripped in ("hi", "hello", "hey", "menu", "namaste", "hii", "hlo"):
@@ -76,6 +88,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
         qty = parse_quantity_only(text, target_unit=pending_item["unit"])
         if qty:
             svc.clear_pending_item(customer["id"])
+            clear_interruption(customer["id"])
             fake_parsed = {
                 "intent": "new_order",
                 "language": lang,
@@ -85,8 +98,28 @@ async def handle_text_message(from_number: str, text: str) -> None:
                 "note": "",
             }
             await handle_new_order(from_number, customer, fake_parsed, text, lang)
+            set_state(customer["id"], ConversationState.CART_REVIEW, current=ConversationState.WAITING_QUANTITY)
             return
         else:
+            # Not a parseable quantity — could be a genuine side-quest ("apple ka price?")
+            # rather than a garbled quantity. Ask Groq what this actually is; if it's a
+            # real order/other intent, treat it as an interruption: answer it, then
+            # remind the customer we're still waiting on their quantity, and stay
+            # parked in WAITING_QUANTITY (pending_item is untouched) so their next
+            # message is still interpreted as the quantity.
+            menu = svc.get_available_menu()
+            parsed = parse_message(text, menu)
+            if parsed["intent"] == "other" and parsed.get("note"):
+                push_interruption(customer["id"], ConversationState.WAITING_QUANTITY)
+                shopkeeper_reply = generate_shopkeeper_reply(
+                    f"Customer wrote: \"{text}\". Context: {parsed['note']}. "
+                    f"After answering, remind them you're still waiting on the quantity for {pending_item['name_en']}.",
+                    lang, SHOP_NAME,
+                )
+                if shopkeeper_reply:
+                    await send_text(from_number, shopkeeper_reply)
+                    return
+
             await send_text(from_number, _t(
                 lang,
                 f"Sorry, didn't catch that — how much {pending_item['name_en']} would you like? (e.g. 2 {pending_item['unit']})",
@@ -114,22 +147,27 @@ async def handle_text_message(from_number: str, text: str) -> None:
 
     if intent == "greeting":
         await greeting_and_menu(from_number, lang)
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
         return
 
     if intent == "address":
         await handle_address(from_number, customer, parsed, lang)
+        set_state(customer["id"], ConversationState.PAYMENT_PENDING, current=ConversationState.ADDRESS_COLLECTION)
         return
 
     if intent == "cancel_order":
         await handle_cancel(from_number, customer, lang)
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
         return
 
     if intent == "reorder":
         await handle_reorder(from_number, customer, lang)
+        set_state(customer["id"], ConversationState.DELIVERY_SELECTION, current=current_state)
         return
 
     if intent == "edit_order":
         await handle_edit(from_number, customer, parsed, lang)
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
         return
 
     if intent == "new_order":
@@ -179,6 +217,7 @@ async def handle_text_message(from_number: str, text: str) -> None:
 # ---------- button reply handler ----------
 async def handle_button_reply(from_number: str, button_id: str) -> None:
     customer = svc.get_or_create_customer(from_number)
+    current_state = get_state(customer)
     lang = customer.get("preferred_language") or "en"
 
     # ---- tapped a language choice ----
@@ -192,6 +231,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             "बढ़िया! आपको किस नाम से बुलाऊं? 😊 (सिर्फ पहला नाम)",
             "Great! Aapka naam kya bataun? 😊 (bas pehla naam)",
         ))
+        set_state(customer["id"], ConversationState.NAME_CAPTURE, current=current_state)
         return
 
     # ---- tapped a product row from the List Message ----
@@ -211,6 +251,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             f"{product['name_en']} — कितना चाहिए? (जैसे 2 {product['unit']})",
             f"{product['name_en']} — kitna chahiye? (jaise 2 {product['unit']})",
         ))
+        set_state(customer["id"], ConversationState.WAITING_QUANTITY, current=current_state)
         return
 
     # ---- order confirmation ----
@@ -244,6 +285,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             from_number, customer, items_for_order, lines,
             pending.get("unavailable_items", []), pending.get("raw_message", ""), lang,
         )
+        set_state(customer["id"], ConversationState.DELIVERY_SELECTION, current=ConversationState.CART_REVIEW)
         return
 
     if button_id == "edit_order":
@@ -253,6 +295,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             "कोई बात नहीं — सही ऑर्डर दोबारा भेजें 🙏",
             "Koi baat nahi — sahi order dobara bhejo 🙏",
         ))
+        set_state(customer["id"], ConversationState.BROWSING, current=ConversationState.CART_REVIEW)
         return
 
     # ---- delivery / pickup / address buttons (post-order) ----
@@ -268,6 +311,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
                 ))
             if order.get("payment_mode", "unset") == "unset":
                 await send_payment_buttons(from_number, lang)
+                set_state(customer["id"], ConversationState.PAYMENT_PENDING, current=current_state)
         return
 
     if button_id == "change_address":
@@ -276,6 +320,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             "ठीक है — नया पता बताएं?",
             "Theek hai — naya address batao?",
         ))
+        set_state(customer["id"], ConversationState.ADDRESS_COLLECTION, current=current_state)
         return
 
     if button_id == "want_delivery":
@@ -284,10 +329,12 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             "📍 आपका डिलीवरी पता क्या है?",
             "📍 Delivery address kya hai?",
         ))
+        set_state(customer["id"], ConversationState.ADDRESS_COLLECTION, current=current_state)
         return
 
     if button_id == "choose_pickup":
         await apply_pickup(from_number, customer, lang)
+        set_state(customer["id"], ConversationState.PAYMENT_PENDING, current=current_state)
         return
 
     # ---- payment ----
@@ -311,6 +358,7 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             f"₹{order['total']:.0f} UPI से भुगतान करने के लिए टैप करें:\n{link}\n\nभुगतान होते ही हम आपका ऑर्डर तैयार करना शुरू कर देंगे{who} 🙏",
             f"₹{order['total']:.0f} UPI se pay karne ke liye tap karo:\n{link}\n\nPayment hote hi order taiyar karna shuru kar denge{who} 🙏",
         ))
+        set_state(customer["id"], ConversationState.ORDER_CONFIRMED, current=ConversationState.PAYMENT_PENDING)
     elif button_id == "pay_cod":
         svc.set_order_payment_mode(order["id"], "cod")
         log_event("PAYMENT_STARTED", customer_id=customer["id"], details={"order_id": order["id"], "mode": "cod", "amount": order["total"]})
@@ -325,3 +373,4 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
             f"Kisi bhi zaroori baat ke liye call karo: {SHOP_WHATSAPP_DISPLAY_NUMBER}.",
         ))
         svc.set_order_status(order["id"], "confirmed")
+        set_state(customer["id"], ConversationState.ORDER_CONFIRMED, current=ConversationState.PAYMENT_PENDING)

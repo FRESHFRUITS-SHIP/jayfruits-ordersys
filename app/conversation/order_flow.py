@@ -5,6 +5,7 @@ from app.services import orders as svc
 from app.services.audit import log_event
 from app.conversation.messages import _t, _fmt_qty, _name_bit
 from app.conversation.fulfillment import ask_fulfillment_or_address
+from app.conversation.state import ConversationState, set_state
 
 
 async def finalize_order(
@@ -84,6 +85,7 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
                 button_text=_t(lang, "Choose Variant", "चुनें", "Choose Karo"),
                 sections=sections,
             )
+            set_state(customer["id"], ConversationState.SELECTING_VARIANT)
             return
 
         product = matched.get(item["product_name"]) or (variants[0] if variants else None)
@@ -95,6 +97,7 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
                 f"{product['name_en']} — कितना चाहिए? (जैसे 2 {product['unit']})",
                 f"{product['name_en']} — kitna chahiye? (jaise 2 {product['unit']})",
             ))
+            set_state(customer["id"], ConversationState.WAITING_QUANTITY)
             return
 
     items_for_order = []
@@ -169,6 +172,7 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
             ("edit_order", _t(lang, "✏️ Edit", "✏️ बदलें", "✏️ Edit")),
         ],
     )
+    set_state(customer["id"], ConversationState.CART_REVIEW)
 
 
 async def handle_edit(to: str, customer: dict, parsed: dict, lang: str) -> None:
