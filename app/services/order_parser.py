@@ -216,11 +216,14 @@ def _classify_unit_word(word: str) -> str | None:
     return None
 
 
-def _convert(val: float, from_unit: str, to_unit: str) -> float | None:
+def convert_unit(val: float, from_unit: str, to_unit: str) -> float | None:
     """Converts between units the shop actually sells in. Returns None if the
     pair isn't a sensible conversion (e.g. someone said 'litre' for a kg product).
     Units without a natural conversion partner (packet, bunch, piece<->kg, etc.)
-    simply aren't in this table — that's intentional, not an oversight."""
+    simply aren't in this table — that's intentional, not an oversight.
+    Public (no leading underscore) — reused by order_flow.py's multi-item
+    path so unit validation is consistent everywhere quantities are parsed,
+    not just the single-item pending_item flow."""
     if from_unit == to_unit:
         return val
     pair = {from_unit, to_unit}
@@ -286,7 +289,7 @@ def parse_quantity_only(text: str, target_unit: str = "kg") -> float | None:
     if detected_unit == target_unit:
         return val
 
-    converted = _convert(val, detected_unit, target_unit)
+    converted = convert_unit(val, detected_unit, target_unit)
     if converted is not None:
         return converted
 

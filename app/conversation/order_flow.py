@@ -3,6 +3,7 @@ Pulled out of webhook.py, pure move — no behavior change."""
 from app.services.whatsapp import send_text, send_buttons, send_image, send_list_menu
 from app.services import orders as svc
 from app.services.audit import log_event
+from app.services.order_parser import convert_unit
 from app.conversation.messages import _t, _fmt_qty, _name_bit
 from app.conversation.fulfillment import ask_fulfillment_or_address
 from app.conversation.state import ConversationState, set_state
@@ -102,6 +103,7 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
 
     items_for_order = []
     lines = []
+    unit_mismatch_items = []
     for item in parsed["items"]:
         product = matched.get(item["product_name"])
         if not product:
@@ -116,9 +118,38 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
             ))
             return
         qty = float(qty)
+
+        # CRITICAL SAFETY CHECK: Groq may extract a unit ("piece") that
+        # differs from how this product is actually sold ("dozen"). Never
+        # apply the raw number directly against the product's price without
+        # checking — that's exactly how "6 piece kela" silently became
+        # "6 dozen" (₹360 instead of ~₹30) in earlier testing. Convert if
+        # there's a clean conversion (piece<->dozen, gram<->kg, ml<->litre);
+        # otherwise stop and ask, same never-guess rule already used in the
+        # single-item pending_item flow.
+        stated_unit = item.get("unit") or product["unit"]
+        if stated_unit != product["unit"]:
+            converted = convert_unit(qty, stated_unit, product["unit"])
+            if converted is None:
+                unit_mismatch_items.append(f"{product['name_en']} ({item.get('quantity')} {stated_unit})")
+                continue
+            qty = converted
+
         items_for_order.append({"product": product, "quantity": qty})
         line_total = product["price"] * qty
         lines.append(f"• {product['name_en']} — {_fmt_qty(qty)} {product['unit']} × ₹{product['price']} = ₹{line_total:.0f}")
+
+    if unit_mismatch_items:
+        await send_text(to, _t(
+            lang,
+            f"Not sure how much you meant for: {', '.join(unit_mismatch_items)}. "
+            f"Could you say it in the shop's usual unit? e.g. '2 dozen banana' or '1kg mango'",
+            f"समझ नहीं आया कितना चाहिए: {', '.join(unit_mismatch_items)}। "
+            f"कृपया सामान्य इकाई में बताएं, जैसे '2 dozen banana' या '1kg mango'",
+            f"Samajh nahi aaya kitna chahiye: {', '.join(unit_mismatch_items)}. "
+            f"Shop ki usual unit mein batao, jaise '2 dozen banana' ya '1kg mango'",
+        ))
+        return
 
     unavailable = parsed.get("unavailable_items", [])
 
