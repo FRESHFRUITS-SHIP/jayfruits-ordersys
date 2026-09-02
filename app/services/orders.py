@@ -182,25 +182,30 @@ def set_customer_name(customer_id: int, name: str) -> None:
 
 def set_pending_order(customer_id: int, data: dict) -> None:
     """Holds a parsed-but-not-yet-created order until the customer taps Confirm."""
-    update_customer(customer_id, {"pending_order": data})
+    from datetime import datetime, timezone
+    update_customer(customer_id, {
+        "pending_order": data,
+        "pending_order_set_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def clear_pending_order(customer_id: int) -> None:
-    update_customer(customer_id, {"pending_order": None})
+    update_customer(customer_id, {"pending_order": None, "pending_order_set_at": None})
 
 
 def set_pending_item(customer_id: int, product: dict) -> None:
     """Stash the product a customer named without a quantity, so the next message
     (assumed to be just a quantity, e.g. '2kg') can complete the order."""
+    from datetime import datetime, timezone
     update_customer(customer_id, {"pending_item": {
         "product_id": product["id"],
         "name_en": product["name_en"],
         "unit": product["unit"],
-    }})
+    }, "pending_item_set_at": datetime.now(timezone.utc).isoformat()})
 
 
 def clear_pending_item(customer_id: int) -> None:
-    update_customer(customer_id, {"pending_item": None})
+    update_customer(customer_id, {"pending_item": None, "pending_item_set_at": None})
 
 
 def get_all_customers_with_stats() -> list[dict]:

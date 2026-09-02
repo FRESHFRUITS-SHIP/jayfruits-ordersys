@@ -16,7 +16,7 @@ from app.services.upi import build_upi_link
 from app.services import orders as svc
 from app.services.audit import log_event
 
-from app.conversation.messages import _t, _fmt_qty, _name_bit, ACKNOWLEDGEMENT_WORDS, ABOUT_TRIGGERS, PICKUP_WORDS, send_about_message
+from app.conversation.messages import _t, _fmt_qty, _name_bit, ACKNOWLEDGEMENT_WORDS, ABOUT_TRIGGERS, PICKUP_WORDS, NEGATIVE_WORDS, send_about_message
 from app.conversation.onboarding import send_language_selection, greeting_and_menu
 from app.conversation.fulfillment import send_payment_buttons, ask_fulfillment_or_address, apply_pickup, handle_address
 from app.conversation.order_flow import handle_new_order, handle_edit, handle_cancel, handle_reorder, finalize_order
@@ -24,6 +24,26 @@ from app.conversation.state import (
     ConversationState, get_state, set_state,
     push_interruption, pop_interruption, clear_interruption,
 )
+
+PENDING_TTL_MINUTES = 30  # after this, don't silently resume old pending_item/pending_order context
+
+
+def _is_pending_expired(set_at_str: str | None) -> bool:
+    """True if a pending_item/pending_order timestamp is older than the TTL,
+    or if there's no timestamp at all (treat missing as expired — fail safe
+    rather than silently trusting undated state, e.g. from before this
+    column existed)."""
+    if not set_at_str:
+        return True
+    from datetime import datetime, timezone
+    try:
+        set_at = datetime.fromisoformat(set_at_str.replace("Z", "+00:00"))
+        if set_at.tzinfo is None:
+            set_at = set_at.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - set_at).total_seconds() / 60
+        return age_minutes > PENDING_TTL_MINUTES
+    except (ValueError, TypeError):
+        return True
 
 
 # ---------- main conversation handler ----------
@@ -81,8 +101,32 @@ async def handle_text_message(from_number: str, text: str) -> None:
         await apply_pickup(from_number, customer, lang)
         return
 
+    # ---- customer typed a decline ("no") instead of tapping the Edit button
+    # while Confirm/Edit buttons were pending. Without this check it fell
+    # through to a generic "didn't understand" reply — confusing right after
+    # the bot just asked "Looks good?". Treat it the same as tapping Edit. ----
+    if current_state == ConversationState.CART_REVIEW and customer.get("pending_order") and stripped in NEGATIVE_WORDS:
+        lang = customer.get("preferred_language") or "en"
+        svc.clear_pending_order(customer["id"])
+        await send_text(from_number, _t(
+            lang, "No problem — send the corrected order whenever you're ready 🙏",
+            "कोई बात नहीं — सही ऑर्डर दोबारा भेजें 🙏",
+            "Koi baat nahi — sahi order dobara bhejo 🙏",
+        ))
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
+        return
+
     # ---- pending "kitna chahiye?" flow: this message is expected to be just a quantity ----
     pending_item = customer.get("pending_item")
+    if pending_item and _is_pending_expired(customer.get("pending_item_set_at")):
+        # Customer replied long after we asked — don't silently resume old
+        # context (they may have forgotten what they were ordering, or the
+        # menu/price may have changed since). Clear it and fall through to
+        # treat this message fresh, same as if nothing was pending.
+        svc.clear_pending_item(customer["id"])
+        set_state(customer["id"], ConversationState.BROWSING, current=current_state)
+        pending_item = None
+
     if pending_item:
         lang = customer.get("preferred_language") or "en"
         qty = parse_quantity_only(text, target_unit=pending_item["unit"])
@@ -262,6 +306,18 @@ async def handle_button_reply(from_number: str, button_id: str) -> None:
                 lang, "Nothing to confirm — send your order again.",
                 "कन्फ़र्म करने के लिए कुछ नहीं — दोबारा ऑर्डर भेजें।",
                 "Confirm karne ko kuch nahi — dobara order bhejo.",
+            ))
+            return
+        if _is_pending_expired(customer.get("pending_order_set_at")):
+            # Stale draft — prices/availability may have changed since. Don't
+            # silently commit an old confirmation; make them resend fresh.
+            svc.clear_pending_order(customer["id"])
+            set_state(customer["id"], ConversationState.BROWSING, current=current_state)
+            await send_text(from_number, _t(
+                lang,
+                "That order summary has expired — please resend your order to get current prices.",
+                "यह ऑर्डर पुराना हो गया है — कृपया दोबारा ऑर्डर भेजें ताकि सही कीमत मिल सके।",
+                "Yeh order purana ho gaya hai — dobara order bhejo taaki sahi price mile.",
             ))
             return
         items_for_order = []

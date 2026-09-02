@@ -4,6 +4,7 @@ from app.services.whatsapp import send_text, send_buttons, send_image, send_list
 from app.services import orders as svc
 from app.services.audit import log_event
 from app.services.order_parser import convert_unit
+from app.conversation.validation import validate_quantity
 from app.conversation.messages import _t, _fmt_qty, _name_bit
 from app.conversation.fulfillment import ask_fulfillment_or_address
 from app.conversation.state import ConversationState, set_state
@@ -119,21 +120,58 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
             return
         qty = float(qty)
 
-        # CRITICAL SAFETY CHECK: Groq may extract a unit ("piece") that
-        # differs from how this product is actually sold ("dozen"). Never
-        # apply the raw number directly against the product's price without
-        # checking — that's exactly how "6 piece kela" silently became
-        # "6 dozen" (₹360 instead of ~₹30) in earlier testing. Convert if
-        # there's a clean conversion (piece<->dozen, gram<->kg, ml<->litre);
-        # otherwise stop and ask, same never-guess rule already used in the
-        # single-item pending_item flow.
-        stated_unit = item.get("unit") or product["unit"]
-        if stated_unit != product["unit"]:
+        # CRITICAL SAFETY CHECK, two parts:
+        #
+        # 1) Groq may extract a unit ("piece") that differs from how this
+        #    product is actually sold ("dozen"). Never apply the raw number
+        #    directly against the product's price without checking — that's
+        #    exactly how "6 piece kela" silently became "6 dozen"
+        #    (₹360 instead of ~₹30).
+        #
+        # 2) A BARE number with NO unit word at all ("7 sev", "3 apple") is
+        #    only safe to assume in the product's own unit when that unit is
+        #    itself a count (piece/packet/bunch) — a bare "7" naturally means
+        #    "7 of them". For weight/volume/dozen units (kg, gram, litre, ml,
+        #    dozen), a bare number is genuinely ambiguous: "7 sev" almost
+        #    certainly means 7 individual apples, not 7 kilograms, and
+        #    silently assuming kg produced a real ₹1260 order for what the
+        #    customer meant as a handful of apples. Ask instead of guessing.
+        stated_unit = item.get("unit")
+        BARE_COUNT_SAFE_UNITS = {"piece", "packet", "bunch"}
+
+        if not stated_unit:
+            if product["unit"] not in BARE_COUNT_SAFE_UNITS:
+                unit_mismatch_items.append(f"{product['name_en']} ({item.get('quantity')}, unit unclear)")
+                continue
+            # bare count against a genuinely count-based unit — safe as-is
+        elif stated_unit != product["unit"]:
             converted = convert_unit(qty, stated_unit, product["unit"])
             if converted is None:
                 unit_mismatch_items.append(f"{product['name_en']} ({item.get('quantity')} {stated_unit})")
                 continue
             qty = converted
+
+        # BUSINESS-RULE VALIDATION — separate layer from the unit-matching
+        # above. Even after the unit is confirmed correct, the number itself
+        # could still be wrong: a stray negative/zero from a parsing slip, or
+        # a typo/misheard-voice-note that turned "1kg" into "10kg"/"100kg".
+        # Never let a raw number reach a real order without this check.
+        is_valid, reason = validate_quantity(qty, product["unit"])
+        if not is_valid:
+            if reason == "zero_or_negative":
+                # Customer almost certainly meant "don't add this" — omit
+                # silently rather than error, matching the prompt's own
+                # zero/negative-quantity rule (it shouldn't reach here often,
+                # this is the code-side backstop for when it does).
+                continue
+            elif reason == "too_large":
+                unit_mismatch_items.append(
+                    f"{product['name_en']} ({_fmt_qty(qty)} {product['unit']} — that's a lot, please confirm)"
+                )
+                continue
+            else:  # unknown_unit — shouldn't normally happen, fail safe
+                unit_mismatch_items.append(f"{product['name_en']} ({_fmt_qty(qty)} {product['unit']})")
+                continue
 
         items_for_order.append({"product": product, "quantity": qty})
         line_total = product["price"] * qty
@@ -143,11 +181,11 @@ async def handle_new_order(to: str, customer: dict, parsed: dict, raw_text: str,
         await send_text(to, _t(
             lang,
             f"Not sure how much you meant for: {', '.join(unit_mismatch_items)}. "
-            f"Could you say it in the shop's usual unit? e.g. '2 dozen banana' or '1kg mango'",
+            f"We sell these by weight — could you say it like '1kg' or '500g'?",
             f"समझ नहीं आया कितना चाहिए: {', '.join(unit_mismatch_items)}। "
-            f"कृपया सामान्य इकाई में बताएं, जैसे '2 dozen banana' या '1kg mango'",
+            f"हम इन्हें वज़न के हिसाब से बेचते हैं — कृपया '1kg' या '500g' जैसे बताएं",
             f"Samajh nahi aaya kitna chahiye: {', '.join(unit_mismatch_items)}. "
-            f"Shop ki usual unit mein batao, jaise '2 dozen banana' ya '1kg mango'",
+            f"Hum wajan ke hisaab se bechte hain — '1kg' ya '500g' jaise batao",
         ))
         return
 

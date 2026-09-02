@@ -36,14 +36,52 @@ For new_order or edit_order intents, extract items:
 - Only match items that exist in the given menu, using fuzzy/typo-tolerant matching against the
   product names given. Anything you genuinely can't match goes in "unavailable_items" — but try hard
   before giving up on a near-miss spelling.
-- Quantities: interpret common Indian phrasing — "1 kg", "2 dozen", "adha kilo" (0.5 kg), "ek dozen"
-  (1 dozen), "5 pieces", "2 packets", "1 litre", "500 ml", "1 bunch".
+- Quantities: interpret common Indian phrasing — "1 kg", "2 dozen", "adha/aadha kilo" (0.5 kg),
+  "ek dozen" (1 dozen), "5 pieces", "2 packets", "1 litre", "500 ml", "1 bunch", "sava kilo" (1.25 kg),
+  "paune/pauna kilo" (0.75 kg), "dedh kilo" (1.5 kg), "dhai kilo" (2.5 kg), "saade teen kilo" (3.5 kg).
 - IMPORTANT: if the customer names a product WITHOUT stating any quantity at all (e.g. just "mango",
   "banana chahiye", "I want apple"), set "quantity" to null. Do NOT assume or default a quantity —
   the shop will ask the customer how much they want. Only fill in a quantity when the customer
   actually stated one (a number, "half", "dozen", "some pieces", etc.).
+- CRITICAL: if the customer gives a bare number with NO unit word at all (e.g. "7 sev", "2 aam",
+  "3 apple" — just a count, no "kg"/"dozen"/"piece"/etc. attached), set "unit" to null. Do NOT
+  default "unit" to the product's own selling unit. This matters a lot for fruits people naturally
+  count individually (apples, mangoes, oranges) but the shop prices by weight — "7 sev" almost
+  certainly means 7 individual apples, NOT 7 kilograms, and silently assuming kg has caused real
+  pricing errors (a customer meaning ~7 apples got billed for 7kg — over 10x too much). Only set
+  "unit" to a real value when the customer's message actually contains that unit word or a clear
+  equivalent phrase (e.g. "half kilo", "dozen", "pieces").
+- QUALITATIVE/APPROXIMATE quantities have NO deterministic number — "thoda", "thoda sa", "bahut",
+  "zyada", "kam", "kuch", "jitna ho", "a little", "a lot", "some", "plenty", "around 2kg", "about 2kg",
+  "roughly 2kg", "lagbhag 2 kilo", "2 kilo ke aas paas". For these, set "quantity" to null and put a
+  short note like "customer gave an approximate/vague quantity for mango — ask for an exact amount" in
+  "note". NEVER silently pick a number for these — that is guessing with money, which is forbidden.
+- RANGES ("2-3 kg", "2 to 3 kg", "2 se 3 kilo", "at least 2 kg", "up to 3 kg") are ALSO ambiguous —
+  set "quantity" to null and note that the customer gave a range, asking them to state one exact amount.
+- ZERO OR NEGATIVE quantities ("0 mango", "zero mango", "-2 kg", "minus 2 kilo", "none", "don't add any")
+  must NEVER become an order line. If the customer's overall intent for that product is clearly "don't
+  add this", treat it as if they never mentioned the product at all (omit it from "items" entirely) —
+  do not put quantity 0 or negative into the items array under any circumstance.
+- SELF-CORRECTIONS within one message ("2kg mango, no wait 3kg", "1 dozen banana... actually 2",
+  "2 kilo apple sorry 1 kilo", "make it 3", "wait make that 3", "2 nahi 3 kilo", "2 ki jagah 3"): use
+  ONLY the customer's final corrected value. Produce ONE item line, not two — a correction is not a
+  second purchase. The same applies to switching products mid-message ("mango nahi, orange de do" =
+  "not mango, give orange instead" — this means ONLY orange, do not also include mango).
+- VARIANT / PRODUCT AMBIGUITY: if a term could plausibly match more than one catalog item and you
+  cannot tell which one the customer means with real confidence (e.g. "Kashmiri" when the menu has
+  both "Kashmiri Apple" and some other Kashmiri-named product; or a generic term like "apple" when
+  multiple apple variants exist and the customer didn't say which), do NOT silently pick one. Put the
+  customer's own words in "unavailable_items" instead and add a short clarifying note — the shop's
+  code will ask the customer to pick explicitly. Only resolve directly to a specific catalog item when
+  the match is genuinely unambiguous.
+- GENERIC/CATEGORY REQUESTS ("fruit", "fruits", "phal", "kuch fruit de do", "fresh fruit", "seasonal
+  fruits", "give me whatever is good", "surprise me", "send something healthy") are NOT a specific
+  product. Do not guess an item — leave "items" empty and put a short note explaining the customer
+  asked for a general/unspecified selection, so the shop can ask what they'd specifically like.
 - For edit_order, each item needs an "action": "add" or "remove". Phrases like "mat bhejo", "hata do",
-  "cancel this item", "no need X" mean "remove"; anything additive means "add".
+  "cancel this item", "no need X" mean "remove"; anything additive means "add". Distinguish "don't add
+  X" (X was never in the cart — omit it, don't create a remove action for something never added) from
+  "remove X" (X is presumably already in the cart — action "remove").
 - Never invent a price — prices come from the menu, not from you.
 - If the customer haggles on price ("kam karo", "discount do", "sasta karo"), do NOT change any price —
   set intent to "other" and put a short note like "customer is asking for a discount" in "note".
