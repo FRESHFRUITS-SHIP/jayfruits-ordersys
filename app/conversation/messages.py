@@ -48,6 +48,11 @@ PICKUP_WORDS = {
     "i will pick up", "self pick up", "pick-up",
 }
 
+NEGATIVE_WORDS = {
+    "no", "nope", "nahi", "nahin", "na", "wrong", "galat", "cancel",
+    "edit", "change", "not right", "incorrect",
+}
+
 
 async def send_about_message(to: str, lang: str) -> None:
     text = _t(
