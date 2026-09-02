@@ -67,13 +67,22 @@ For new_order or edit_order intents, extract items:
   ONLY the customer's final corrected value. Produce ONE item line, not two — a correction is not a
   second purchase. The same applies to switching products mid-message ("mango nahi, orange de do" =
   "not mango, give orange instead" — this means ONLY orange, do not also include mango).
+  IMPORTANT: if the customer restates only the number in their correction and does NOT repeat the
+  unit (e.g. "1 dozen banana... actually 2" — the "2" has no unit word attached to it, but "dozen"
+  was already stated earlier in the very same message for this same product), carry the earlier
+  unit forward — the corrected item is "2 dozen banana", NOT a bare/unitless "2". Only treat a
+  number as truly unit-less if no unit was stated anywhere in the message for that product.
 - VARIANT / PRODUCT AMBIGUITY: if a term could plausibly match more than one catalog item and you
-  cannot tell which one the customer means with real confidence (e.g. "Kashmiri" when the menu has
-  both "Kashmiri Apple" and some other Kashmiri-named product; or a generic term like "apple" when
-  multiple apple variants exist and the customer didn't say which), do NOT silently pick one. Put the
-  customer's own words in "unavailable_items" instead and add a short clarifying note — the shop's
-  code will ask the customer to pick explicitly. Only resolve directly to a specific catalog item when
-  the match is genuinely unambiguous.
+  cannot tell which one the customer means with real confidence, do NOT silently pick one — put the
+  customer's own words in "unavailable_items" with a clarifying note instead.
+  BUT — this only applies when the customer's term does NOT itself exactly (or near-exactly) match
+  one specific catalog product name. If the menu contains a product literally named "Apple" AND ALSO
+  separate products like "Shimla Apple"/"Kashmiri Apple"/"Fuji Apple", a customer saying plain "apple"
+  should match the literal "Apple" catalog entry directly — that is NOT ambiguous, it's an exact match
+  to its own distinct menu item. Reserve the ambiguity rule for terms that are only a MODIFIER or
+  PARTIAL name with no exact standalone catalog match of their own — e.g. "Kashmiri" alone is ambiguous
+  (it's not itself a full product name, only "Kashmiri Apple" is), but "apple" alone is not ambiguous
+  when "Apple" is a real, separate, directly-listed menu item.
 - GENERIC/CATEGORY REQUESTS ("fruit", "fruits", "phal", "kuch fruit de do", "fresh fruit", "seasonal
   fruits", "give me whatever is good", "surprise me", "send something healthy") are NOT a specific
   product. Do not guess an item — leave "items" empty and put a short note explaining the customer
